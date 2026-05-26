@@ -1,0 +1,114 @@
+export type ActivityType = "multiple_choice" | "true_false" | "short_answer";
+export type LiveStatus = "waiting" | "active" | "ended";
+export type MessageStatus = "visible" | "hidden" | "deleted";
+
+export interface EventRecord {
+  id: string;
+  title: string;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ActivityOption {
+  id: string;
+  label: string;
+}
+
+export interface ActivityRecord {
+  id: string;
+  eventId: string;
+  type: ActivityType;
+  title: string;
+  description: string;
+  options: ActivityOption[];
+  correctAnswer: unknown;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ActiveLiveSessionSummary {
+  id: string;
+  joinCode: string;
+  status: LiveStatus;
+  participantCount: number;
+  startedAt: string | null;
+}
+
+export interface LiveSessionRecord {
+  id: string;
+  eventId: string;
+  joinCode: string;
+  status: LiveStatus;
+  currentActivityId: string | null;
+  currentActivityIndex: number;
+  showResults: boolean;
+  showParticipantNames: boolean;
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ParticipantRecord {
+  id: string;
+  liveSessionId: string;
+  nickname: string;
+  joinedAt: string;
+  lastSeenAt: string;
+}
+
+export interface ResponseRecord {
+  id: string;
+  liveSessionId: string;
+  activityId: string;
+  participantId: string;
+  answer: unknown;
+  receivedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LiveMessageRecord {
+  id: string;
+  liveSessionId: string;
+  participantId: string;
+  participantName: string;
+  content: string;
+  status: MessageStatus;
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
+  moderatedAt: string | null;
+}
+
+export interface ResponseSummary {
+  type: ActivityType;
+  total: number;
+  options?: Array<ActivityOption & { count: number; percent: number; isCorrect?: boolean }>;
+  responses?: Array<{
+    participantName: string | null;
+    answerLabel?: string;
+    optionId?: string;
+    text?: string;
+    isCorrect?: boolean | null;
+    receivedAt: string;
+  }>;
+}
+
+export interface LiveState {
+  liveSession: LiveSessionRecord;
+  event: EventRecord;
+  activities?: ActivityRecord[];
+  currentActivity: ActivityRecord | null;
+  participantCount: number;
+  responseSummary: ResponseSummary | null;
+  me?: ParticipantRecord | null;
+  myResponse?: ResponseRecord | null;
+}
+
+export interface SocketMessage<T = unknown> {
+  type: string;
+  payload: T;
+}

@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      JWT_SECRET: ${JWT_SECRET:-replace-with-a-long-random-secret}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: slihoot
+      DB_PASSWORD: slihoot
+      DB_NAME: slihoot
+      DB_AUTO_MIGRATE: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: slihoot
+      MYSQL_USER: slihoot
+      MYSQL_PASSWORD: slihoot
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uslihoot", "-pslihoot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mysql-data:
+
