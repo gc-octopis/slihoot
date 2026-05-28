@@ -13,7 +13,7 @@ import type {
 } from "./types";
 import { pool } from "./db";
 
-const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_answer"];
+const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_answer", "word_cloud"];
 
 function id() {
   return crypto.randomUUID();
@@ -77,7 +77,7 @@ function normalizeText(value: unknown, maxLength: number) {
 }
 
 function normalizeOptions(type: ActivityType, options: unknown): ActivityOption[] {
-  if (type === "short_answer") return [];
+  if (type === "short_answer" || type === "word_cloud") return [];
 
   if (type === "true_false") {
     return [
@@ -108,7 +108,7 @@ function normalizeCorrectAnswer(
   options: ActivityOption[],
   correctAnswer: unknown
 ) {
-  if (type === "short_answer") return null;
+  if (type === "short_answer" || type === "word_cloud") return null;
   const answerObject =
     typeof correctAnswer === "object" && correctAnswer !== null ? (correctAnswer as any) : {};
   const optionId = normalizeText(answerObject.optionId ?? correctAnswer, 80);
@@ -692,10 +692,22 @@ function validateAnswer(activity: ActivityRecord, answer: unknown) {
     return { text };
   }
 
+  if (activity.type === "word_cloud") {
+    const text = normalizeText(answerObject.text, 80);
+    if (!text) throw new Error("Word cloud text is required.");
+    return { text };
+  }
+
   const optionId = normalizeText(answerObject.optionId, 80);
   const option = activity.options.find((candidate) => candidate.id === optionId);
   if (!option) throw new Error("Invalid answer option.");
   return { optionId };
+}
+
+function extractWordCloudTexts(answer: unknown): string[] {
+  const answerObject = typeof answer === "object" && answer !== null ? (answer as any) : {};
+  const values: unknown[] = Array.isArray(answerObject.texts) ? answerObject.texts : [answerObject.text];
+  return values.map((value) => normalizeText(value, 80)).filter(Boolean);
 }
 
 export async function submitAnswer(input: {
@@ -719,6 +731,12 @@ export async function submitAnswer(input: {
   const answer = validateAnswer(activity, input.answer);
   const responseId = id();
   const receivedAt = nowDate();
+  const answerForStorage =
+    activity.type === "word_cloud"
+      ? {
+          texts: [...extractWordCloudTexts((await getResponse(input.liveId, input.activityId, input.participantId))?.answer), answer.text]
+        }
+      : answer;
 
   await pool.execute(
     `INSERT INTO responses
@@ -733,7 +751,7 @@ export async function submitAnswer(input: {
       liveId: input.liveId,
       activityId: input.activityId,
       participantId: input.participantId,
-      answerJson: stringifyJson(answer),
+      answerJson: stringifyJson(answerForStorage),
       receivedAt
     }
   );
@@ -804,7 +822,43 @@ export async function getResponseSummary(
             isCorrect: null,
             receivedAt: answer.receivedAt
           }))
-        : undefined
+      : undefined
+    } satisfies ResponseSummary;
+  }
+
+  if (activity.type === "word_cloud") {
+    const wordEntries = answers.flatMap((answer) =>
+      extractWordCloudTexts(answer.answer).map((text) => ({
+        text,
+        participantName: answer.participantName,
+        receivedAt: answer.receivedAt
+      }))
+    );
+    const words = new Map<string, { text: string; count: number }>();
+
+    for (const { text } of wordEntries) {
+      const key = text.toLocaleLowerCase();
+      const current = words.get(key);
+      if (current) {
+        current.count += 1;
+      } else {
+        words.set(key, { text, count: 1 });
+      }
+    }
+
+    const maxCount = Math.max(1, ...Array.from(words.values()).map((word) => word.count));
+
+    return {
+      type: activity.type,
+      total: wordEntries.length,
+      words: Array.from(words.values())
+        .sort((a, b) => b.count - a.count || a.text.localeCompare(b.text))
+        .slice(0, 40)
+        .map((word) => ({
+          ...word,
+          percent: wordEntries.length === 0 ? 0 : Math.round((word.count / wordEntries.length) * 100),
+          weight: word.count / maxCount
+        }))
     } satisfies ResponseSummary;
   }
 

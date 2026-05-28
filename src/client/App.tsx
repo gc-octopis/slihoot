@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import type {
   ActiveLiveSessionSummary,
   ActivityOption,
@@ -37,6 +38,16 @@ type ActivityDraft = {
   correctOptionId: string;
 };
 
+type TryCloudflareTunnelState = {
+  status: "stopped" | "starting" | "running" | "error";
+  localUrl: string | null;
+  publicUrl: string | null;
+  pid: number | null;
+  startedAt: string | null;
+  lastError: string | null;
+  logs: string[];
+};
+
 function navigate(path: string) {
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
@@ -58,6 +69,38 @@ function wsUrl(params: Record<string, string>) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const search = new URLSearchParams(params);
   return `${protocol}//${window.location.host}/ws?${search.toString()}`;
+}
+
+async function copyToClipboard(text: string) {
+  if (!text) return false;
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through
+  }
+
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "true");
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "0";
+    textarea.style.opacity = "0";
+
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function useLiveSocket(options: {
@@ -216,7 +259,10 @@ function LoginPage() {
 }
 
 function JoinPage() {
-  const [joinCode, setJoinCode] = useState("");
+  const [joinCode, setJoinCode] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return (params.get("joinCode") ?? "").toUpperCase().slice(0, 8);
+  });
   const [nickname, setNickname] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -260,7 +306,7 @@ function JoinPage() {
           <label>
             活動代碼
             <input
-              autoFocus
+              autoFocus={!joinCode}
               value={joinCode}
               onChange={(event) => setJoinCode(event.target.value.toUpperCase())}
               placeholder="例如 A8K2QW"
@@ -270,6 +316,7 @@ function JoinPage() {
           <label>
             暱稱
             <input
+              autoFocus={Boolean(joinCode)}
               value={nickname}
               onChange={(event) => setNickname(event.target.value)}
               placeholder="你的名字"
@@ -439,7 +486,7 @@ function createDefaultActivityDraft(): ActivityDraft {
 }
 
 function optionsForType(type: ActivityType, currentOptions: ActivityOption[]) {
-  if (type === "short_answer") return [];
+  if (type === "short_answer" || type === "word_cloud") return [];
   if (type === "true_false") {
     return [
       { id: "true", label: "是" },
@@ -455,6 +502,63 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   const [draft, setDraft] = useState<ActivityDraft>(() => createDefaultActivityDraft());
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reordering, setReordering] = useState(false);
+
+  const activityListRef = useRef<HTMLElement | null>(null);
+  const activityListFlipRef = useRef<Map<string, DOMRect> | null>(null);
+  const activityListFlipPendingRef = useRef(false);
+
+  const recordActivityListFlip = useCallback(() => {
+    const container = activityListRef.current;
+    if (!container) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const rects = new Map<string, DOMRect>();
+    container.querySelectorAll<HTMLElement>("[data-flip-id]").forEach((element) => {
+      const id = element.dataset.flipId;
+      if (!id) return;
+      rects.set(id, element.getBoundingClientRect());
+    });
+
+    activityListFlipRef.current = rects;
+    activityListFlipPendingRef.current = true;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!activityListFlipPendingRef.current) return;
+    activityListFlipPendingRef.current = false;
+
+    const container = activityListRef.current;
+    const firstRects = activityListFlipRef.current;
+    activityListFlipRef.current = null;
+    if (!container || !firstRects) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const elements = Array.from(container.querySelectorAll<HTMLElement>("[data-flip-id]"));
+    for (const element of elements) {
+      const id = element.dataset.flipId;
+      if (!id) continue;
+      const first = firstRects.get(id);
+      if (!first) continue;
+
+      const last = element.getBoundingClientRect();
+      const deltaX = first.left - last.left;
+      const deltaY = first.top - last.top;
+      if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) continue;
+
+      const animation = element.animate(
+        [
+          { transform: `translate(${deltaX}px, ${deltaY}px)` },
+          { transform: "translate(0, 0)" }
+        ],
+        {
+          duration: 200,
+          easing: "cubic-bezier(0.2, 0.0, 0.2, 1)"
+        }
+      );
+      animation.onfinish = () => animation.cancel();
+    }
+  }, [event?.activities]);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -495,15 +599,20 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   async function saveEvent(eventForm: React.FormEvent) {
     eventForm.preventDefault();
     if (!token || !event) return;
-    const updated = await api<EventDetail>(`/api/events/${event.id}`, {
-      method: "PUT",
-      adminToken: token,
-      body: {
-        title: event.title,
-        description: event.description
-      }
-    });
-    setEvent(updated);
+    try {
+      const updated = await api<EventDetail>(`/api/events/${event.id}`, {
+        method: "PUT",
+        adminToken: token,
+        body: {
+          title: event.title,
+          description: event.description
+        }
+      });
+      setEvent(updated);
+      navigate("/admin/dashboard");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to save event.");
+    }
   }
 
   async function saveActivity(activityForm: React.FormEvent) {
@@ -538,18 +647,30 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   }
 
   async function moveActivity(activityId: string, direction: -1 | 1) {
-    if (!token || !event) return;
+    if (!token || !event || reordering) return;
     const activities = [...event.activities];
     const index = activities.findIndex((activity) => activity.id === activityId);
     const nextIndex = index + direction;
     if (index < 0 || nextIndex < 0 || nextIndex >= activities.length) return;
     [activities[index], activities[nextIndex]] = [activities[nextIndex], activities[index]];
-    const reordered = await api<ActivityRecord[]>(`/api/events/${event.id}/activities/reorder`, {
-      method: "PUT",
-      adminToken: token,
-      body: { activityIds: activities.map((activity) => activity.id) }
-    });
-    setEvent({ ...event, activities: reordered });
+
+    recordActivityListFlip();
+    setEvent({ ...event, activities });
+
+    setReordering(true);
+    try {
+      const reordered = await api<ActivityRecord[]>(`/api/events/${event.id}/activities/reorder`, {
+        method: "PUT",
+        adminToken: token,
+        body: { activityIds: activities.map((activity) => activity.id) }
+      });
+      setEvent((current) => (current ? { ...current, activities: reordered } : current));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to reorder activity.");
+      setEvent(event);
+    } finally {
+      setReordering(false);
+    }
   }
 
   if (!event) {
@@ -617,6 +738,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   <option value="multiple_choice">選擇題</option>
                   <option value="true_false">是非題</option>
                   <option value="short_answer">簡答題</option>
+                  <option value="word_cloud">文字雲</option>
                 </select>
               </label>
               <label>
@@ -633,7 +755,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   onChange={(change) => setDraft({ ...draft, description: change.target.value })}
                 />
               </label>
-              {draft.type !== "short_answer" ? (
+              {draft.type === "multiple_choice" || draft.type === "true_false" ? (
                 <div className="form-stack">
                   <span className="field-label">選項與正確答案</span>
                   <div className="option-editor">
@@ -718,9 +840,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           </section>
         </div>
 
-        <section className="activity-list">
+        <section className="activity-list" ref={activityListRef}>
           {event.activities.map((activity, index) => (
-            <article className="item-card" key={activity.id}>
+            <article className="item-card" key={activity.id} data-flip-id={activity.id}>
               <div>
                 <small>#{index + 1} {activity.type}</small>
                 <h2>{activity.title}</h2>
@@ -737,8 +859,18 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                 ) : null}
               </div>
               <div className="button-row">
-                <button onClick={() => moveActivity(activity.id, -1)}>上移</button>
-                <button onClick={() => moveActivity(activity.id, 1)}>下移</button>
+                <button
+                  disabled={reordering || index === 0}
+                  onClick={() => moveActivity(activity.id, -1)}
+                >
+                  上移
+                </button>
+                <button
+                  disabled={reordering || index === event.activities.length - 1}
+                  onClick={() => moveActivity(activity.id, 1)}
+                >
+                  下移
+                </button>
                 <button onClick={() => editActivity(activity)}>編輯</button>
                 <button className="danger" onClick={() => removeActivity(activity.id)}>
                   刪除
@@ -771,6 +903,16 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
           </p>
         )}
       </div>
+    );
+  }
+
+  if (summary.type === "word_cloud") {
+    return (
+      <>
+        {summary.words?.length ? <WordCloudView words={summary.words} /> : (
+          <p className="muted">尚未收到文字。</p>
+        )}
+      </>
     );
   }
 
@@ -897,11 +1039,220 @@ function mergeMessage(messages: LiveMessageRecord[], message: LiveMessageRecord)
   return next;
 }
 
+type WordCloudWord = NonNullable<ResponseSummary["words"]>[number];
+
+function hashText(text: string) {
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function measureWordWidth(text: string, fontSize: number) {
+  const widthUnits = Array.from(text).reduce((total, char) => {
+    if (/[\u3000-\u9fff\uff00-\uffef]/.test(char)) return total + 1;
+    if (/[A-Z0-9]/.test(char)) return total + 0.68;
+    return total + 0.56;
+  }, 0);
+  return Math.max(fontSize, widthUnits * fontSize);
+}
+
+function intersects(
+  box: { left: number; right: number; top: number; bottom: number },
+  boxes: Array<{ left: number; right: number; top: number; bottom: number }>
+) {
+  return boxes.some(
+    (placed) =>
+      box.left < placed.right &&
+      box.right > placed.left &&
+      box.top < placed.bottom &&
+      box.bottom > placed.top
+  );
+}
+
+function layoutWordCloud(words: WordCloudWord[]) {
+  const width = 800;
+  const height = 420;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const boxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+
+  return [...words]
+    .sort((a, b) => b.count - a.count || a.text.localeCompare(b.text))
+    .slice(0, 60)
+    .flatMap((word) => {
+      const fontSize = Math.round(18 + Math.pow(word.weight, 0.72) * 54);
+      const wordWidth = measureWordWidth(word.text, fontSize);
+      const wordHeight = fontSize * 1.05;
+      const seed = hashText(word.text);
+      const angleOffset = (seed % 628) / 100;
+
+      for (let attempt = 0; attempt < 650; attempt += 1) {
+        const angle = angleOffset + attempt * 0.38;
+        const radius = 2.8 * angle;
+        const x = centerX + Math.cos(angle) * radius;
+        const y = centerY + Math.sin(angle) * radius * 0.62;
+        const box = {
+          left: x - wordWidth / 2 - 7,
+          right: x + wordWidth / 2 + 7,
+          top: y - wordHeight / 2 - 5,
+          bottom: y + wordHeight / 2 + 5
+        };
+
+        if (box.left < 14 || box.right > width - 14 || box.top < 14 || box.bottom > height - 14) {
+          continue;
+        }
+
+        if (intersects(box, boxes)) continue;
+
+        boxes.push(box);
+        return [
+          {
+            ...word,
+            x,
+            y,
+            fontSize,
+            colorIndex: seed % 6
+          }
+        ];
+      }
+
+      return [];
+    });
+}
+
+function WordCloudView({ words }: { words: WordCloudWord[] }) {
+  const placedWords = useMemo(() => layoutWordCloud(words), [words]);
+  const colors = ["#176b87", "#1b7f55", "#b45f06", "#7a3e9d", "#9f2d55", "#3856a6"];
+
+  return (
+    <svg className="word-cloud" viewBox="0 0 800 420" role="img" aria-label="文字雲結果">
+      <rect width="800" height="420" rx="8" />
+      {placedWords.map((word) => (
+        <text
+          className="word-cloud-text"
+          key={word.text}
+          x={word.x}
+          y={word.y}
+          fill={colors[word.colorIndex]}
+          fontSize={word.fontSize}
+        >
+          <title>{`${word.text}: ${word.count} 票，${word.percent}%`}</title>
+          {word.text}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
 function AdminLivePage({ liveId }: { liveId: string }) {
   const token = getAdminToken();
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+  const copyTimerRef = useRef<number | null>(null);
+  const qrDialogRef = useRef<HTMLDialogElement | null>(null);
+  const [tryTunnel, setTryTunnel] = useState<TryCloudflareTunnelState | null>(null);
+  const tunnelPollRef = useRef<number | null>(null);
+  const localPortForTunnel = useMemo(() => {
+    const port = window.location.port ? Number(window.location.port) : NaN;
+    if (Number.isFinite(port) && port > 0) return port;
+    return window.location.protocol === "https:" ? 443 : 80;
+  }, []);
+  const autoTunnelAttemptRef = useRef<string | null>(null);
+
+  const joinCode = state?.liveSession.joinCode ?? "";
+  const effectiveBaseUrl = useMemo(() => {
+    const tunnelUrl = tryTunnel?.status === "running" ? tryTunnel.publicUrl : null;
+    return tunnelUrl ?? "";
+  }, [tryTunnel?.publicUrl, tryTunnel?.status]);
+  const joinUrl = useMemo(() => {
+    if (!joinCode) return "";
+    if (!effectiveBaseUrl) return "";
+    const url = new URL("/", effectiveBaseUrl);
+    url.searchParams.set("joinCode", joinCode);
+    return url.toString();
+  }, [effectiveBaseUrl, joinCode]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
+
+  const loadTryTunnelState = useCallback(async () => {
+    if (!token) return null;
+    const loaded = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare", {
+      adminToken: token
+    });
+    setTryTunnel(loaded);
+    return loaded;
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    loadTryTunnelState().catch(() => {});
+  }, [loadTryTunnelState, token]);
+
+  useEffect(() => {
+    if (!token) return;
+    if (tryTunnel?.status !== "starting") return;
+
+    if (tunnelPollRef.current) window.clearInterval(tunnelPollRef.current);
+    const timer = window.setInterval(() => {
+      loadTryTunnelState().catch(() => {});
+    }, 800);
+    tunnelPollRef.current = timer;
+
+    return () => {
+      window.clearInterval(timer);
+      if (tunnelPollRef.current === timer) tunnelPollRef.current = null;
+    };
+  }, [loadTryTunnelState, token, tryTunnel?.status]);
+
+  const startTryTunnel = useCallback(async () => {
+    if (!token) return;
+    try {
+      const started = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare/start", {
+        method: "POST",
+        adminToken: token,
+        body: { port: localPortForTunnel }
+      });
+      setTryTunnel(started);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to start tunnel.");
+    }
+  }, [localPortForTunnel, token]);
+
+  useEffect(() => {
+    if (!token) return;
+    if (!joinCode) return;
+    if (tryTunnel?.status === "running" || tryTunnel?.status === "starting") return;
+    if (autoTunnelAttemptRef.current === joinCode) return;
+
+    autoTunnelAttemptRef.current = joinCode;
+    startTryTunnel();
+  }, [joinCode, startTryTunnel, token, tryTunnel?.status]);
+
+  const copyJoinUrl = useCallback(async () => {
+    if (!joinUrl) return;
+    const ok = await copyToClipboard(joinUrl);
+    setCopyStatus(ok ? "copied" : "error");
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopyStatus("idle"), 1800);
+  }, [joinUrl]);
+
+  const openJoinQr = useCallback(() => {
+    const dialog = qrDialogRef.current;
+    if (!dialog) return;
+    if (tryTunnel?.status !== "running" && tryTunnel?.status !== "starting") {
+      startTryTunnel();
+    }
+    if (dialog.open) return;
+    dialog.showModal();
+  }, [startTryTunnel, tryTunnel?.status]);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -968,6 +1319,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const currentIndex = activities.findIndex((activity) => activity.id === state?.currentActivity?.id);
   const previousActivity = activities[currentIndex - 1];
   const nextActivity = activities[currentIndex + 1];
+  const isWordCloudActivity = state?.currentActivity?.type === "word_cloud";
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
@@ -986,10 +1338,56 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           actions={<button onClick={() => navigate("/admin/dashboard")}>回列表</button>}
         />
         <ErrorBanner message={error} />
+        <dialog
+          ref={qrDialogRef}
+          className="qr-dialog"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              event.currentTarget.close();
+            }
+          }}
+        >
+          <form method="dialog" className="form-stack">
+            <div className="share-dialog-header">
+              <h2>分享連結</h2>
+              <button
+                type="button"
+                className="icon-button close-button"
+                aria-label="關閉"
+                onClick={() => qrDialogRef.current?.close()}
+              >
+                ×
+              </button>
+            </div>
+            {tryTunnel?.status === "starting" ? (
+              <p className="muted">Cloudflare 分享連結產生中...</p>
+            ) : null}
+            {tryTunnel?.lastError ? <div className="error-banner">{tryTunnel.lastError}</div> : null}
+            {joinUrl ? (
+              <div className="qr-preview">
+                <QRCodeSVG value={joinUrl} size={260} marginSize={4} />
+              </div>
+            ) : (
+              <p className="muted">尚未取得 Cloudflare 分享連結。</p>
+            )}
+            <label>
+              分享連結
+              <input readOnly value={joinUrl} />
+            </label>
+            <div className="button-row">
+              <button type="button" disabled={!joinUrl} onClick={copyJoinUrl}>
+                {copyStatus === "copied" ? "已複製" : "複製連結"}
+              </button>
+            </div>
+          </form>
+        </dialog>
         <section className="live-main panel">
           <div className="status-row">
             <span className={socket.connected ? "status online" : "status"} />
-            <strong>代碼 {state?.liveSession.joinCode ?? "..."}</strong>
+            <strong>代碼 {joinCode || "..."}</strong>
+            <button className="secondary" disabled={!joinCode} onClick={openJoinQr}>
+              分享連結
+            </button>
             <span>{state?.participantCount ?? 0} 人加入</span>
             <span>{state?.liveSession.status}</span>
           </div>
@@ -1014,6 +1412,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               下一題
             </button>
             <button
+              hidden={isWordCloudActivity}
               onClick={() =>
                 socket.send("set_results_visibility", {
                   showResults: !state?.liveSession.showResults
@@ -1023,6 +1422,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
             </button>
             <button
+              hidden={isWordCloudActivity}
               onClick={() =>
                 socket.send("set_participant_name_visibility", {
                   showParticipantNames: !state?.liveSession.showParticipantNames
@@ -1059,7 +1459,7 @@ function AnswerForm({
 }: {
   activity: ActivityRecord;
   disabled: boolean;
-  onSubmit: (answer: unknown) => void;
+  onSubmit: (answer: unknown) => boolean | void;
 }) {
   const [selected, setSelected] = useState("");
   const [text, setText] = useState("");
@@ -1068,6 +1468,28 @@ function AnswerForm({
     setSelected("");
     setText("");
   }, [activity.id]);
+
+  if (activity.type === "word_cloud") {
+    return (
+      <form
+        className="form-stack"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const sent = onSubmit({ text });
+          if (sent !== false) setText("");
+        }}
+      >
+        <input
+          value={text}
+          disabled={disabled}
+          onChange={(event) => setText(event.target.value)}
+          placeholder="輸入一個詞或短句"
+          maxLength={80}
+        />
+        <button disabled={disabled || !text.trim()}>{disabled ? "已送出" : "送出文字"}</button>
+      </form>
+    );
+  }
 
   if (activity.type === "short_answer") {
     return (
@@ -1181,7 +1603,7 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   });
 
   const currentActivity = state?.currentActivity ?? null;
-  const answered = Boolean(localResponse);
+  const answerLocked = Boolean(localResponse) && currentActivity?.type !== "word_cloud";
   const sortedMessages = useMemo(
     () => [...messages].sort((a, b) => Number(a.pinned !== b.pinned) * (a.pinned ? -1 : 1)),
     [messages]
@@ -1216,13 +1638,14 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
             </div>
             <AnswerForm
               activity={currentActivity}
-              disabled={answered || state?.liveSession.status === "ended"}
+              disabled={answerLocked || state?.liveSession.status === "ended"}
               onSubmit={(answer) => {
                 const sent = socket.send("submit_answer", {
                   activityId: currentActivity.id,
                   answer
                 });
-                if (sent) setLocalResponse({} as ResponseRecord);
+                if (sent && currentActivity.type !== "word_cloud") setLocalResponse({} as ResponseRecord);
+                return sent;
               }}
             />
             {state?.liveSession.showResults ? (

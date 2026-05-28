@@ -2,6 +2,7 @@ export const env = {
   port: Number(Bun.env.PORT ?? 3000),
   adminPassword: Bun.env.ADMIN_PASSWORD ?? "change-me",
   jwtSecret: Bun.env.JWT_SECRET ?? "replace-with-a-long-random-secret",
+  cloudflaredPath: Bun.env.CLOUDFLARED_PATH ?? "",
   db: {
     host: Bun.env.DB_HOST ?? "127.0.0.1",
     port: Number(Bun.env.DB_PORT ?? 3306),

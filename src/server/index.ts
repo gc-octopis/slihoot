@@ -2,6 +2,9 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { createBunWebSocket, serveStatic } from "hono/bun";
+import { readdir } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
+import { join } from "node:path";
 import { env, assertRuntimeConfig } from "./env";
 import { migrate } from "./db";
 import {
@@ -61,6 +64,222 @@ interface SocketClient {
 const clients = new Map<string, SocketClient>();
 const rooms = new Map<string, Set<string>>();
 const messageRateLimits = new Map<string, number>();
+
+type TryCloudflareTunnelStatus = "stopped" | "starting" | "running" | "error";
+
+interface TryCloudflareTunnelState {
+  status: TryCloudflareTunnelStatus;
+  localUrl: string | null;
+  publicUrl: string | null;
+  pid: number | null;
+  startedAt: string | null;
+  lastError: string | null;
+  logs: string[];
+}
+
+let tryCloudflareRunId = 0;
+let tryCloudflareController: AbortController | null = null;
+let tryCloudflareProc: Bun.Subprocess | null = null;
+let tryCloudflareState: TryCloudflareTunnelState = {
+  status: "stopped",
+  localUrl: null,
+  publicUrl: null,
+  pid: null,
+  startedAt: null,
+  lastError: null,
+  logs: []
+};
+
+async function findCloudflaredInKnownWindowsLocations() {
+  const roots = [
+    Bun.env.LOCALAPPDATA ? join(Bun.env.LOCALAPPDATA, "Microsoft", "WinGet", "Packages") : "",
+    Bun.env.USERPROFILE
+      ? join(Bun.env.USERPROFILE, "AppData", "Local", "Microsoft", "WinGet", "Packages")
+      : ""
+  ].filter(Boolean);
+
+  const checked = new Set<string>();
+  for (const root of roots) {
+    if (checked.has(root)) continue;
+    checked.add(root);
+
+    const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.toLowerCase().startsWith("cloudflare.cloudflared_")) continue;
+
+      const candidate = join(root, entry.name, "cloudflared.exe");
+      if (await Bun.file(candidate).exists().catch(() => false)) return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function resolveCloudflaredExecutable(): Promise<{ path: string | null; error: string | null }> {
+  const configured = String(env.cloudflaredPath ?? "").trim().replace(/^["']|["']$/g, "");
+  if (configured) {
+    const exists = await Bun.file(configured).exists().catch(() => false);
+    if (exists) return { path: configured, error: null };
+    return { path: null, error: `CLOUDFLARED_PATH points to a missing file: ${configured}` };
+  }
+
+  const found = Bun.which("cloudflared") ?? Bun.which("cloudflared.exe");
+  if (found) return { path: found, error: null };
+
+  const wingetPath = await findCloudflaredInKnownWindowsLocations();
+  if (wingetPath) return { path: wingetPath, error: null };
+
+  return {
+    path: null,
+    error:
+      'cloudflared not found. Install it (Windows): "winget install -e --id Cloudflare.cloudflared", then restart the backend (bun run dev). Or set CLOUDFLARED_PATH to the full path of cloudflared.exe.'
+  };
+}
+
+function addTryCloudflareLog(line: string) {
+  if (!line) return;
+  tryCloudflareState.logs.push(line);
+  if (tryCloudflareState.logs.length > 200) {
+    tryCloudflareState.logs.splice(0, tryCloudflareState.logs.length - 200);
+  }
+
+  if (!tryCloudflareState.publicUrl) {
+    const match = line.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match?.[0]) {
+      tryCloudflareState.publicUrl = match[0];
+      tryCloudflareState.status = "running";
+    }
+  }
+}
+
+async function readStreamLines(stream: ReadableStream<Uint8Array> | number | null | undefined) {
+  if (!stream || typeof stream === "number") return;
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const index = buffer.indexOf("\n");
+      if (index === -1) break;
+      const line = buffer.slice(0, index).trimEnd();
+      buffer = buffer.slice(index + 1);
+      addTryCloudflareLog(line);
+    }
+  }
+
+  const tail = buffer.trim();
+  if (tail) addTryCloudflareLog(tail);
+}
+
+function stopTryCloudflareTunnel() {
+  tryCloudflareRunId += 1;
+
+  tryCloudflareController?.abort();
+  tryCloudflareController = null;
+
+  try {
+    tryCloudflareProc?.kill();
+  } catch {
+    // ignore
+  }
+  tryCloudflareProc = null;
+
+  tryCloudflareState = {
+    status: "stopped",
+    localUrl: null,
+    publicUrl: null,
+    pid: null,
+    startedAt: null,
+    lastError: null,
+    logs: []
+  };
+}
+
+async function startTryCloudflareTunnel(localPort: number) {
+  if (!Number.isFinite(localPort) || localPort < 1 || localPort > 65535) {
+    throw new Error("Invalid port.");
+  }
+
+  if (tryCloudflareState.status === "starting" || tryCloudflareState.status === "running") {
+    return tryCloudflareState;
+  }
+
+  stopTryCloudflareTunnel();
+  tryCloudflareRunId += 1;
+  const runId = tryCloudflareRunId;
+
+  const localUrl = `http://localhost:${localPort}`;
+  tryCloudflareState = {
+    status: "starting",
+    localUrl,
+    publicUrl: null,
+    pid: null,
+    startedAt: new Date().toISOString(),
+    lastError: null,
+    logs: []
+  };
+
+  const controller = new AbortController();
+  tryCloudflareController = controller;
+
+  try {
+    const resolved = await resolveCloudflaredExecutable();
+    if (!resolved.path) {
+      tryCloudflareState.status = "error";
+      tryCloudflareState.lastError = resolved.error ?? "cloudflared not available.";
+      addTryCloudflareLog(tryCloudflareState.lastError);
+      return tryCloudflareState;
+    }
+
+    const proc = Bun.spawn({
+      cmd: [resolved.path, "tunnel", "--url", localUrl],
+      stdout: "pipe",
+      stderr: "pipe",
+      signal: controller.signal,
+      windowsHide: true,
+      onExit(_proc, exitCode, _signalCode, error) {
+        if (runId !== tryCloudflareRunId) return;
+        if (tryCloudflareState.status === "stopped") return;
+
+        if (error) {
+          tryCloudflareState.status = "error";
+          tryCloudflareState.lastError = error.message ?? "cloudflared exited.";
+          return;
+        }
+
+        if (exitCode === 0 && tryCloudflareState.status !== "running") {
+          tryCloudflareState.status = "error";
+          tryCloudflareState.lastError = "cloudflared exited unexpectedly.";
+        } else if (exitCode !== 0 && tryCloudflareState.status !== "running") {
+          tryCloudflareState.status = "error";
+          tryCloudflareState.lastError = `cloudflared exited with code ${exitCode ?? "unknown"}.`;
+        }
+      }
+    });
+
+    proc.unref();
+
+    tryCloudflareProc = proc;
+    tryCloudflareState.pid = proc.pid;
+
+    void readStreamLines(proc.stdout);
+    void readStreamLines(proc.stderr);
+
+    return tryCloudflareState;
+  } catch (error) {
+    tryCloudflareState.status = "error";
+    tryCloudflareState.lastError =
+      error instanceof Error ? error.message : "Failed to start cloudflared.";
+    return tryCloudflareState;
+  }
+}
 
 function socketId() {
   return crypto.randomUUID();
@@ -332,6 +551,59 @@ app.post("/api/auth/login", async (c) => {
 });
 
 app.get("/api/auth/me", requireAdmin, (c) => c.json({ role: "admin" }));
+
+app.get("/api/system/network", requireAdmin, (c) =>
+  routeJson(c, async () => {
+    const interfaces = networkInterfaces();
+    const ipv4 = new Set<string>();
+
+    for (const addresses of Object.values(interfaces)) {
+      for (const address of addresses ?? []) {
+        const family = (address as any).family;
+        const isV4 = family === "IPv4" || family === 4;
+        if (!isV4) continue;
+        if ((address as any).internal) continue;
+        const value = String((address as any).address ?? "");
+        if (!value) continue;
+        ipv4.add(value);
+      }
+    }
+
+    const ranked = Array.from(ipv4)
+      .filter((ip) => ip && ip !== "0.0.0.0" && !ip.startsWith("169.254."))
+      .sort((a, b) => {
+        const rank = (ip: string) => {
+          const parts = ip.split(".").map((value) => Number(value));
+          if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return 99;
+          const [p1, p2] = parts;
+          if (p1 === 192 && p2 === 168) return 0;
+          if (p1 === 10) return 1;
+          if (p1 === 172 && p2 >= 16 && p2 <= 31) return 2;
+          return 50;
+        };
+        return rank(a) - rank(b) || a.localeCompare(b);
+      });
+
+    return { ipv4: ranked };
+  })
+);
+
+app.get("/api/tunnel/trycloudflare", requireAdmin, (c) => c.json(tryCloudflareState));
+
+app.post("/api/tunnel/trycloudflare/start", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    const body = (await readBody(c)) as any;
+    const port = Number(body.port ?? body.localPort);
+    return startTryCloudflareTunnel(port);
+  })
+);
+
+app.post("/api/tunnel/trycloudflare/stop", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    stopTryCloudflareTunnel();
+    return tryCloudflareState;
+  })
+);
 
 app.get("/api/events", requireAdmin, (c) => routeJson(c, () => listEvents()));
 
