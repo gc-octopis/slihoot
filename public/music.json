@@ -1,0 +1,15 @@
+{
+    "lobby": [
+        "Screen Saver.ogg"
+    ],
+    "game": [
+        "Aurea Carmina.ogg",
+        "Disco Medusae.ogg",
+        "Ether Disco.ogg",
+        "Stringed Disco.ogg"
+    ],
+    "bell": [
+        "bell1.ogg",
+        "bell2.ogg"
+    ]
+}
