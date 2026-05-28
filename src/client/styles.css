@@ -461,6 +461,42 @@ small {
   padding: 12px;
 }
 
+.word-cloud {
+  display: block;
+  width: 100%;
+  min-height: 260px;
+  border: 1px solid #edf1f3;
+  border-radius: 8px;
+  background: #f6f7f9;
+  font-family:
+    "Microsoft JhengHei",
+    "PingFang TC",
+    "Noto Sans CJK TC",
+    "Noto Sans CJK",
+    sans-serif;
+}
+
+.word-cloud rect {
+  fill: #f6f7f9;
+}
+
+.word-cloud-text {
+  dominant-baseline: central;
+  text-anchor: middle;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(246, 247, 249, 0.82);
+  stroke-width: 4px;
+  transition:
+    font-size 180ms ease,
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+.word-cloud-text:hover {
+  opacity: 0.78;
+}
+
 .response-table {
   display: grid;
   overflow: hidden;
@@ -503,6 +539,63 @@ small {
 
 .choice input {
   width: auto;
+}
+
+.qr-dialog {
+  border: 1px solid #dce4e8;
+  border-radius: 12px;
+  padding: 18px;
+  max-width: min(520px, calc(100vw - 32px));
+  width: 100%;
+  box-shadow: 0 14px 50px rgba(18, 31, 38, 0.25);
+}
+
+.qr-dialog::backdrop {
+  background: rgba(23, 32, 38, 0.65);
+}
+
+.share-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.share-dialog-header h2 {
+  margin-bottom: 0;
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  min-height: 36px;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.close-button {
+  background: #e8edf0;
+  color: #172026;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.close-button:hover {
+  background: #dce4e8;
+}
+
+.qr-preview {
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  border-radius: 12px;
+  background: #f6f7f9;
+  border: 1px solid #edf1f3;
+}
+
+.qr-preview svg {
+  display: block;
 }
 
 @media (max-width: 860px) {

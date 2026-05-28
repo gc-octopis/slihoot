@@ -1,4 +1,4 @@
-export type ActivityType = "multiple_choice" | "true_false" | "short_answer";
+export type ActivityType = "multiple_choice" | "true_false" | "short_answer" | "word_cloud";
 export type LiveStatus = "waiting" | "active" | "ended";
 export type MessageStatus = "visible" | "hidden" | "deleted";
 
@@ -90,6 +90,12 @@ export interface ResponseSummary {
   type: ActivityType;
   total: number;
   options?: Array<ActivityOption & { count: number; percent: number; isCorrect?: boolean }>;
+  words?: Array<{
+    text: string;
+    count: number;
+    percent: number;
+    weight: number;
+  }>;
   responses?: Array<{
     participantName: string | null;
     answerLabel?: string;

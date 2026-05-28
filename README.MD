@@ -52,6 +52,22 @@ Open:
 - Participant entry: `http://localhost:5173/`
 - Admin login: `http://localhost:5173/admin`
 
+## Join from a phone
+
+If you share a join link using `localhost`, phones can't open it. Use either:
+
+1) Same Wi‑Fi / LAN: run `bun run dev:web` (it starts Vite with `--host 0.0.0.0`) and share `http://<your-lan-ip>:5173/`.
+
+2) Different networks (no router/NAT setup): install `cloudflared` and start a free quick tunnel from the host UI.
+
+Windows install:
+
+```bash
+winget install -e --id Cloudflare.cloudflared
+```
+
+After install, restart the backend (`bun run dev`) so it can pick up the updated PATH. Then go to the Admin Live page → `QR Code` → `Cloudflare Quick Tunnel` → `Start`, and share the generated `https://*.trycloudflare.com` link / QR.
+
 ## Docker
 
 Run the full MVP stack:
