@@ -73,3 +73,13 @@ bun run typecheck
 bun run build
 bun run start
 ```
+
+---
+
+## Music Credit
+
+"Aurea Carmina", "Disco Medusae", "Ether Disco", "Stringed Disco", "Screen Saver" Kevin MacLeod (incompetech.com)
+Licensed under Creative Commons: By Attribution 4.0 License
+http://creativecommons.org/licenses/by/4.0/
+
+"bell1", "bell2" arranged by gcoctopis
