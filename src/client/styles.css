@@ -655,7 +655,39 @@ small {
   color: #22c55e;
 }
 
+.choice.wrong {
+  border-color: #ef4444;
+  background: rgba(239, 68, 68, 0.14);
+}
+
+.choice.wrong em {
+  font-style: normal;
+  font-weight: 600;
+  color: #ef4444;
+}
+
 .explanation-panel p {
   white-space: pre-wrap;
   line-height: 1.6;
+}
+
+.answer-reveal {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.85rem;
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.12);
+  line-height: 1.6;
+}
+
+.verdict {
+  font-style: normal;
+  font-weight: 600;
+}
+
+.verdict.correct {
+  color: #22c55e;
+}
+
+.verdict.wrong {
+  color: #ef4444;
 }

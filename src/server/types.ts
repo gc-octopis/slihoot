@@ -46,6 +46,7 @@ export interface LiveSessionRecord {
   currentActivityId: string | null;
   currentActivityIndex: number;
   currentActivityStartedAt: string | null;
+  completedActivityIds: string[];
   showResults: boolean;
   showParticipantNames: boolean;
   startedAt: string | null;
@@ -89,6 +90,8 @@ export interface LiveMessageRecord {
 export interface ResponseSummary {
   type: ActivityType;
   total: number;
+  correctAnswerText?: string;
+  correctCount?: number;
   options?: Array<ActivityOption & { count: number; percent: number; isCorrect?: boolean }>;
   words?: Array<{
     text: string;
@@ -115,6 +118,8 @@ export interface LiveState {
   responseSummary: ResponseSummary | null;
   serverNow: string;
   answerRevealed: boolean;
+  answerClosed: boolean;
+  activityOpen: boolean;
   me?: ParticipantRecord | null;
   myResponse?: ResponseRecord | null;
 }

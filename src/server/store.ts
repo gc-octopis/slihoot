@@ -108,9 +108,15 @@ function normalizeCorrectAnswer(
   options: ActivityOption[],
   correctAnswer: unknown
 ) {
-  if (type === "short_answer" || type === "word_cloud") return null;
+  if (type === "word_cloud") return null;
   const answerObject =
     typeof correctAnswer === "object" && correctAnswer !== null ? (correctAnswer as any) : {};
+
+  if (type === "short_answer") {
+    const text = normalizeText(answerObject.text ?? correctAnswer, 500);
+    return text ? { text } : null;
+  }
+
   const optionId = normalizeText(answerObject.optionId ?? correctAnswer, 80);
   return options.some((option) => option.id === optionId) ? { optionId } : null;
 }
@@ -156,6 +162,7 @@ function rowToLiveSession(row: any): LiveSessionRecord {
     currentActivityId: row.currentActivityId,
     currentActivityIndex: Number(row.currentActivityIndex ?? 0),
     currentActivityStartedAt: row.currentActivityStartedAt ? toIso(row.currentActivityStartedAt) : null,
+    completedActivityIds: parseJson<string[]>(row.completedActivityIds, []),
     showResults: Boolean(row.showResults),
     showParticipantNames: Boolean(row.showParticipantNames),
     startedAt: row.startedAt ? toIso(row.startedAt) : null,
@@ -374,7 +381,7 @@ export async function createActivity(
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
-  if ((type === "multiple_choice" || type === "true_false") && !correctAnswer) {
+  if (type !== "word_cloud" && !correctAnswer) {
     throw new Error("請先設定正確答案再新增題目。");
   }
 
@@ -454,7 +461,7 @@ export async function updateActivity(
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
-  if ((type === "multiple_choice" || type === "true_false") && !correctAnswer) {
+  if (type !== "word_cloud" && !correctAnswer) {
     throw new Error("請先設定正確答案再儲存題目。");
   }
 
@@ -553,7 +560,7 @@ export async function startLiveSession(eventId: string) {
       eventId,
       joinCode,
       currentActivityId: firstActivity?.id ?? null,
-      currentActivityStartedAt: firstActivity ? nowDate() : null,
+      currentActivityStartedAt: null,
       startedAt: nowDate()
     }
   );
@@ -571,6 +578,7 @@ export async function getLiveSession(liveId: string) {
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
+      completed_activity_ids AS completedActivityIds,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -601,14 +609,51 @@ export async function setCurrentActivity(liveId: string, activityId: string) {
   const index = activities.findIndex((activity) => activity.id === activityId);
   if (index === -1) throw new Error("Activity does not belong to this live session.");
 
+  const completed = new Set(liveSession.completedActivityIds);
+  if (
+    liveSession.currentActivityId &&
+    liveSession.currentActivityId !== activityId &&
+    liveSession.currentActivityStartedAt
+  ) {
+    completed.add(liveSession.currentActivityId);
+  }
+
+  // A question that has already been answered must not re-arm its timer when
+  // revisited. Keep it open but anchored in the past so it stays revealed/closed.
+  const startedAt = completed.has(activityId) ? new Date(0) : nowDate();
+
   await pool.execute(
     `UPDATE live_sessions
      SET current_activity_id = :activityId,
          current_activity_index = :activityIndex,
          current_activity_started_at = :startedAt,
+         show_results = FALSE,
+         completed_activity_ids = :completedActivityIds
+     WHERE id = :liveId`,
+    {
+      liveId,
+      activityId,
+      activityIndex: index,
+      startedAt,
+      completedActivityIds: stringifyJson(Array.from(completed))
+    }
+  );
+
+  return getLiveSession(liveId);
+}
+
+export async function startActivity(liveId: string) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession || liveSession.status === "ended" || !liveSession.currentActivityId) {
+    return liveSession;
+  }
+
+  await pool.execute(
+    `UPDATE live_sessions
+     SET current_activity_started_at = :startedAt,
          show_results = FALSE
      WHERE id = :liveId`,
-    { liveId, activityId, activityIndex: index, startedAt: nowDate() }
+    { liveId, startedAt: nowDate() }
   );
 
   return getLiveSession(liveId);
@@ -642,6 +687,7 @@ export async function joinLiveSession(input: { joinCode: unknown; nickname: unkn
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
+      completed_activity_ids AS completedActivityIds,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -767,6 +813,10 @@ export async function submitAnswer(input: {
     throw new Error("This activity is not currently active.");
   }
 
+  if (!liveSession.currentActivityStartedAt) {
+    throw new Error("這一題還沒開始作答。");
+  }
+
   const activity = await getActivity(input.activityId);
   if (!activity) throw new Error("Activity not found.");
 
@@ -776,7 +826,12 @@ export async function submitAnswer(input: {
   const answerForStorage =
     activity.type === "word_cloud"
       ? {
-          texts: [...extractWordCloudTexts((await getResponse(input.liveId, input.activityId, input.participantId))?.answer), answer.text]
+          texts: [
+            ...extractWordCloudTexts(
+              (await getResponse(input.liveId, input.activityId, input.participantId))?.answer
+            ),
+            answer.text
+          ]
         }
       : answer;
 
@@ -854,17 +909,29 @@ export async function getResponseSummary(
       : "";
 
   if (activity.type === "short_answer") {
+    const correctText =
+      typeof activity.correctAnswer === "object" && activity.correctAnswer !== null
+        ? normalizeText((activity.correctAnswer as any).text, 500)
+        : "";
+    const graded = answers.map((answer) => ({
+      participantName: answer.participantName,
+      text: normalizeText(answer.answer.text, 500),
+      receivedAt: answer.receivedAt,
+      isCorrect: correctText ? normalizeText(answer.answer.text, 500) === correctText : null
+    }));
     return {
       type: activity.type,
       total: answers.length,
+      correctAnswerText: correctText || undefined,
+      correctCount: correctText ? graded.filter((entry) => entry.isCorrect).length : undefined,
       responses: options.includeResponses
-        ? answers.map((answer) => ({
-            participantName: options.includeParticipantNames ? answer.participantName : null,
-            text: normalizeText(answer.answer.text, 500),
-            isCorrect: null,
-            receivedAt: answer.receivedAt
+        ? graded.map((entry) => ({
+            participantName: options.includeParticipantNames ? entry.participantName : null,
+            text: entry.text,
+            isCorrect: entry.isCorrect,
+            receivedAt: entry.receivedAt
           }))
-      : undefined
+        : undefined
     } satisfies ResponseSummary;
   }
 
@@ -960,16 +1027,24 @@ export async function getLiveState(
     activities[liveSession.currentActivityIndex] ??
     null;
 
-  const answerRevealed = Boolean(
+  const activityOpen = Boolean(currentActivity && liveSession.currentActivityStartedAt);
+  const answerClosed = Boolean(
+    currentActivity && liveSession.completedActivityIds.includes(currentActivity.id)
+  );
+  const timeExpired = Boolean(
     currentActivity &&
       currentActivity.timeLimitSeconds > 0 &&
       liveSession.currentActivityStartedAt &&
       Date.now() - new Date(liveSession.currentActivityStartedAt).getTime() >=
         currentActivity.timeLimitSeconds * 1000
   );
+  const answerRevealed = Boolean(
+    currentActivity &&
+      (answerClosed || timeExpired || (liveSession.showResults && currentActivity.timeLimitSeconds <= 0))
+  );
 
   const responseSummary =
-    currentActivity && (viewer === "admin" || liveSession.showResults || answerRevealed)
+    currentActivity && (viewer === "admin" || answerRevealed)
       ? await getResponseSummary(liveId, currentActivity, {
           includeResponses: viewer === "admin",
           includeParticipantNames: viewer === "admin" && liveSession.showParticipantNames
@@ -981,6 +1056,13 @@ export async function getLiveState(
       ? await getResponse(liveId, currentActivity.id, participantId)
       : undefined;
 
+  const participantActivity =
+    !currentActivity || !activityOpen
+      ? null
+      : answerRevealed
+        ? currentActivity
+        : publicActivity(currentActivity);
+
   return {
     liveSession,
     event: {
@@ -991,15 +1073,13 @@ export async function getLiveState(
       updatedAt: event.updatedAt
     },
     activities: viewer === "admin" ? activities : undefined,
-    currentActivity: currentActivity
-      ? viewer === "admin" || answerRevealed
-        ? currentActivity
-        : publicActivity(currentActivity)
-      : null,
+    currentActivity: viewer === "admin" ? currentActivity : participantActivity,
     participantCount: await countParticipants(liveId),
     responseSummary,
     serverNow: new Date().toISOString(),
     answerRevealed,
+    answerClosed,
+    activityOpen,
     me: participantId ? await getParticipant(participantId) : undefined,
     myResponse
   };

@@ -38,6 +38,7 @@ type ActivityDraft = {
   timeLimitSeconds: number;
   options: ActivityOption[];
   correctOptionId: string;
+  correctText: string;
 };
 
 type TryCloudflareTunnelState = {
@@ -238,6 +239,11 @@ function ErrorBanner({ message }: { message: string | null }) {
 function correctOptionId(correctAnswer: unknown) {
   if (typeof correctAnswer !== "object" || correctAnswer === null) return "";
   return String((correctAnswer as { optionId?: unknown }).optionId ?? "");
+}
+
+function correctAnswerText(correctAnswer: unknown) {
+  if (typeof correctAnswer !== "object" || correctAnswer === null) return "";
+  return String((correctAnswer as { text?: unknown }).text ?? "");
 }
 
 function draftOption(label = ""): ActivityOption {
@@ -516,7 +522,8 @@ function createDefaultActivityDraft(): ActivityDraft {
     explanation: "",
     timeLimitSeconds: 30,
     options: [firstOption, secondOption],
-    correctOptionId: ""
+    correctOptionId: "",
+    correctText: ""
   };
 }
 
@@ -617,7 +624,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       explanation: activity.explanation,
       timeLimitSeconds: activity.timeLimitSeconds,
       options: activity.options,
-      correctOptionId: correctOptionId(activity.correctAnswer)
+      correctOptionId: correctOptionId(activity.correctAnswer),
+      correctText: correctAnswerText(activity.correctAnswer)
     });
   }
 
@@ -631,7 +639,14 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       options: draft.options
         .map((option) => ({ ...option, label: option.label.trim() }))
         .filter((option) => option.label),
-      correctAnswer: draft.correctOptionId ? { optionId: draft.correctOptionId } : null
+      correctAnswer:
+        draft.type === "short_answer"
+          ? draft.correctText.trim()
+            ? { text: draft.correctText.trim() }
+            : null
+          : draft.correctOptionId
+            ? { optionId: draft.correctOptionId }
+            : null
     };
   }
 
@@ -671,11 +686,12 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           body: payloadFromDraft()
         });
       }
+      setError(null);
       setDraft(createDefaultActivityDraft());
       setEditingId(null);
       await load();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "儲存題目失敗");
+      window.alert(error instanceof Error ? error.message : "儲存題目失敗");
     }
   }
 
@@ -883,6 +899,16 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   ) : null}
                 </div>
               ) : null}
+              {draft.type === "short_answer" ? (
+                <label>
+                  正確答案（需與作答完全相同）
+                  <input
+                    value={draft.correctText}
+                    onChange={(change) => setDraft({ ...draft, correctText: change.target.value })}
+                    placeholder="輸入標準答案"
+                  />
+                </label>
+              ) : null}
               <div className="button-row">
                 <button>{editingId ? "更新題目" : "新增題目"}</button>
                 {editingId ? (
@@ -913,6 +939,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                 <h2>{activity.title}</h2>
                 <p>{activity.description}</p>
                 {activity.explanation ? <p className="muted">詳解：{activity.explanation}</p> : null}
+                {activity.type === "short_answer" && correctAnswerText(activity.correctAnswer) ? (
+                  <p className="muted">正解：{correctAnswerText(activity.correctAnswer)}</p>
+                ) : null}
                 {activity.options.length ? (
                   <div className="option-pills">
                     {activity.options.map((option) => (
@@ -956,11 +985,26 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
   if (summary.type === "short_answer") {
     return (
       <div className="answer-list">
+        {summary.correctAnswerText ? (
+          <p className="muted">
+            正確答案：<strong>{summary.correctAnswerText}</strong>
+            {typeof summary.correctCount === "number"
+              ? `（答對 ${summary.correctCount} / ${summary.total}）`
+              : null}
+          </p>
+        ) : null}
         {summary.responses?.length ? (
           summary.responses.map((response, index) => (
             <div className="answer-item" key={`${response.receivedAt}-${index}`}>
               <strong>{response.participantName ?? "匿名"}</strong>
-              <p>{response.text}</p>
+              <p>
+                {response.text}
+                {response.isCorrect === true ? (
+                  <em className="verdict correct"> 正確</em>
+                ) : response.isCorrect === false ? (
+                  <em className="verdict wrong"> 錯誤</em>
+                ) : null}
+              </p>
             </div>
           ))
         ) : (
@@ -1387,6 +1431,9 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const previousActivity = activities[currentIndex - 1];
   const nextActivity = activities[currentIndex + 1];
   const isWordCloudActivity = state?.currentActivity?.type === "word_cloud";
+  const hasCurrentActivity = Boolean(state?.currentActivity);
+  const activityOpen = Boolean(state?.activityOpen);
+  const answerClosed = Boolean(state?.answerClosed);
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
@@ -1464,13 +1511,20 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </small>
             <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
             <p>{state?.currentActivity?.description}</p>
-            {remaining !== null ? (
+            {answerClosed ? (
+              <div className="countdown ended">已結束作答（已公布答案）</div>
+            ) : remaining !== null ? (
               <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
                 {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
               </div>
+            ) : hasCurrentActivity && !activityOpen ? (
+              <div className="countdown">尚未開始作答，參與者看不到題目</div>
             ) : null}
           </div>
           <div className="button-row">
+            {hasCurrentActivity && !activityOpen ? (
+              <button onClick={() => socket.send("start_activity", {})}>開始答題</button>
+            ) : null}
             <button
               disabled={!previousActivity}
               onClick={() => socket.send("change_activity", { activityId: previousActivity.id })}
@@ -1485,6 +1539,10 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </button>
             <button
               hidden={isWordCloudActivity}
+              disabled={remaining !== null && remaining > 0}
+              title={
+                remaining !== null && remaining > 0 ? "倒數結束後才能公布結果" : undefined
+              }
               onClick={() =>
                 socket.send("set_results_visibility", {
                   showResults: !state?.liveSession.showResults
@@ -1528,11 +1586,15 @@ function AnswerForm({
   activity,
   disabled,
   revealed,
+  submittedOptionId = "",
+  submittedText = "",
   onSubmit
 }: {
   activity: ActivityRecord;
   disabled: boolean;
   revealed: boolean;
+  submittedOptionId?: string;
+  submittedText?: string;
   onSubmit: (answer: unknown) => boolean | void;
 }) {
   const [selected, setSelected] = useState("");
@@ -1540,8 +1602,9 @@ function AnswerForm({
   const correctId = correctOptionId(activity.correctAnswer);
 
   useEffect(() => {
-    setSelected("");
-    setText("");
+    setSelected(submittedOptionId);
+    setText(submittedText);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activity.id]);
 
   if (activity.type === "word_cloud") {
@@ -1582,6 +1645,25 @@ function AnswerForm({
           placeholder="輸入你的回答"
         />
         <button disabled={disabled || !text.trim()}>{disabled ? "已送出" : "送出答案"}</button>
+        {revealed ? (
+          <div className="answer-reveal">
+            <p>
+              正確答案：<strong>{correctAnswerText(activity.correctAnswer) || "—"}</strong>
+            </p>
+            {submittedText ? (
+              <p
+                className={
+                  submittedText.trim() === correctAnswerText(activity.correctAnswer)
+                    ? "verdict correct"
+                    : "verdict wrong"
+                }
+              >
+                你的答案：{submittedText}（
+                {submittedText.trim() === correctAnswerText(activity.correctAnswer) ? "正確" : "錯誤"}）
+              </p>
+            ) : null}
+          </div>
+        ) : null}
       </form>
     );
   }
@@ -1597,9 +1679,11 @@ function AnswerForm({
       <div className="choice-list">
         {activity.options.map((option) => {
           const isCorrect = revealed && correctId === option.id;
+          const isWrongPick =
+            revealed && submittedOptionId === option.id && correctId !== option.id;
           return (
             <label
-              className={`choice${isCorrect ? " correct" : ""}`}
+              className={`choice${isCorrect ? " correct" : isWrongPick ? " wrong" : ""}`}
               key={option.id}
             >
               <input
@@ -1612,6 +1696,7 @@ function AnswerForm({
               <span>
                 {option.label}
                 {isCorrect ? <em> 正解</em> : null}
+                {isWrongPick ? <em> 你的選擇</em> : null}
               </span>
             </label>
           );
@@ -1688,8 +1773,16 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
 
   const currentActivity = state?.currentActivity ?? null;
   const answerLocked = Boolean(localResponse) && currentActivity?.type !== "word_cloud";
+  const myAnswer = (localResponse?.answer ?? state?.myResponse?.answer) as
+    | { optionId?: unknown; text?: unknown }
+    | undefined;
+  const submittedOptionId =
+    myAnswer && typeof myAnswer === "object" ? String(myAnswer.optionId ?? "") : "";
+  const submittedText =
+    myAnswer && typeof myAnswer === "object" ? String(myAnswer.text ?? "") : "";
   const remaining = useServerCountdown(state);
   const revealed = Boolean(state?.answerRevealed);
+  const closed = Boolean(state?.answerClosed);
   const timeUp = remaining === 0 || revealed;
   const sortedMessages = useMemo(
     () => [...messages].sort((a, b) => Number(a.pinned !== b.pinned) * (a.pinned ? -1 : 1)),
@@ -1722,7 +1815,9 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
             <div className="question-block">
               <h2>{currentActivity.title}</h2>
               <p>{currentActivity.description}</p>
-              {remaining !== null ? (
+              {closed ? (
+                <div className="countdown ended">已結束作答</div>
+              ) : remaining !== null ? (
                 <div className={`countdown${timeUp ? " ended" : ""}`}>
                   {timeUp ? "時間到" : `剩餘 ${remaining} 秒`}
                 </div>
@@ -1730,8 +1825,14 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
             </div>
             <AnswerForm
               activity={currentActivity}
-              disabled={answerLocked || timeUp || state?.liveSession.status === "ended"}
+              disabled={
+                closed ||
+                state?.liveSession.status === "ended" ||
+                (currentActivity.type === "word_cloud" ? timeUp : answerLocked || timeUp)
+              }
               revealed={revealed}
+              submittedOptionId={submittedOptionId}
+              submittedText={submittedText}
               onSubmit={(answer) => {
                 const sent = socket.send("submit_answer", {
                   activityId: currentActivity.id,
@@ -1754,6 +1855,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
               </section>
             ) : null}
           </>
+        ) : state?.liveSession.currentActivityId ? (
+          <p className="muted">主持人即將開始這一題，請稍候…</p>
         ) : (
           <p className="muted">主持人尚未準備題目。</p>
         )}

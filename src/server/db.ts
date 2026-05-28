@@ -136,4 +136,10 @@ export async function migrate() {
     "time_limit_seconds",
     "time_limit_seconds INT NOT NULL DEFAULT 0 AFTER explanation"
   );
+
+  await addColumnIfMissing(
+    "live_sessions",
+    "completed_activity_ids",
+    "completed_activity_ids JSON NULL AFTER current_activity_started_at"
+  );
 }

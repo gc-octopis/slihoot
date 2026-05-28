@@ -34,6 +34,7 @@ import {
   moderateMessage,
   reorderActivities,
   setCurrentActivity,
+  startActivity,
   setParticipantNameVisibility,
   setResultsVisibility,
   startLiveSession,
@@ -466,6 +467,14 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "admin") throw new Error("Only admin can change activities.");
       const payload = message.payload as any;
       await setCurrentActivity(client.liveId, String(payload.activityId ?? ""));
+      await broadcastState(client.liveId);
+      await scheduleReveal(client.liveId);
+      return;
+    }
+
+    case "start_activity": {
+      if (client.role !== "admin") throw new Error("Only admin can start activities.");
+      await startActivity(client.liveId);
       await broadcastState(client.liveId);
       await scheduleReveal(client.liveId);
       return;
