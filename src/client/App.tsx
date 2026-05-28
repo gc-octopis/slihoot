@@ -33,6 +33,8 @@ type ActivityDraft = {
   type: ActivityType;
   title: string;
   description: string;
+  explanation: string;
+  timeLimitSeconds: number;
   options: ActivityOption[];
   correctOptionId: string;
 };
@@ -129,6 +131,37 @@ function useLiveSocket(options: {
   }, []);
 
   return { connected, send };
+}
+
+function useServerCountdown(state: LiveState | null) {
+  const activityId = state?.currentActivity?.id ?? null;
+  const startedAt = state?.liveSession.currentActivityStartedAt ?? null;
+  const limit = state?.currentActivity?.timeLimitSeconds ?? 0;
+  const offsetRef = useRef(0);
+  const [remaining, setRemaining] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (state?.serverNow) {
+      offsetRef.current = new Date(state.serverNow).getTime() - Date.now();
+    }
+  }, [state?.serverNow]);
+
+  useEffect(() => {
+    if (!activityId || !startedAt || limit <= 0) {
+      setRemaining(null);
+      return;
+    }
+    const startedMs = new Date(startedAt).getTime();
+    const tick = () => {
+      const serverNow = Date.now() + offsetRef.current;
+      setRemaining(Math.max(0, Math.ceil((startedMs + limit * 1000 - serverNow) / 1000)));
+    };
+    tick();
+    const interval = window.setInterval(tick, 250);
+    return () => window.clearInterval(interval);
+  }, [activityId, startedAt, limit]);
+
+  return remaining;
 }
 
 function AdminGuard({ children }: { children: React.ReactNode }) {
@@ -433,6 +466,8 @@ function createDefaultActivityDraft(): ActivityDraft {
     type: "multiple_choice",
     title: "",
     description: "",
+    explanation: "",
+    timeLimitSeconds: 30,
     options: [firstOption, secondOption],
     correctOptionId: ""
   };
@@ -475,6 +510,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       type: activity.type,
       title: activity.title,
       description: activity.description,
+      explanation: activity.explanation,
+      timeLimitSeconds: activity.timeLimitSeconds,
       options: activity.options,
       correctOptionId: correctOptionId(activity.correctAnswer)
     });
@@ -485,6 +522,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       type: draft.type,
       title: draft.title,
       description: draft.description,
+      explanation: draft.explanation,
+      timeLimitSeconds: draft.timeLimitSeconds,
       options: draft.options
         .map((option) => ({ ...option, label: option.label.trim() }))
         .filter((option) => option.label),
@@ -633,6 +672,29 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   onChange={(change) => setDraft({ ...draft, description: change.target.value })}
                 />
               </label>
+              <label>
+                詳解
+                <textarea
+                  value={draft.explanation}
+                  onChange={(change) => setDraft({ ...draft, explanation: change.target.value })}
+                  placeholder="時間到後向參與者顯示的解析"
+                />
+              </label>
+              <label>
+                作答秒數（0 表示不限時）
+                <input
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={draft.timeLimitSeconds}
+                  onChange={(change) =>
+                    setDraft({
+                      ...draft,
+                      timeLimitSeconds: Math.max(0, Math.min(3600, Number(change.target.value) || 0))
+                    })
+                  }
+                />
+              </label>
               {draft.type !== "short_answer" ? (
                 <div className="form-stack">
                   <span className="field-label">選項與正確答案</span>
@@ -722,9 +784,13 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           {event.activities.map((activity, index) => (
             <article className="item-card" key={activity.id}>
               <div>
-                <small>#{index + 1} {activity.type}</small>
+                <small>
+                  #{index + 1} {activity.type}
+                  {activity.timeLimitSeconds > 0 ? ` · ${activity.timeLimitSeconds} 秒` : " · 不限時"}
+                </small>
                 <h2>{activity.title}</h2>
                 <p>{activity.description}</p>
+                {activity.explanation ? <p className="muted">詳解：{activity.explanation}</p> : null}
                 {activity.options.length ? (
                   <div className="option-pills">
                     {activity.options.map((option) => (
@@ -964,6 +1030,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     onError: setError
   });
 
+  const remaining = useServerCountdown(state);
   const activities = state?.activities ?? [];
   const currentIndex = activities.findIndex((activity) => activity.id === state?.currentActivity?.id);
   const previousActivity = activities[currentIndex - 1];
@@ -999,6 +1066,11 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </small>
             <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
             <p>{state?.currentActivity?.description}</p>
+            {remaining !== null ? (
+              <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
+                {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
+              </div>
+            ) : null}
           </div>
           <div className="button-row">
             <button
@@ -1055,14 +1127,17 @@ function AdminLivePage({ liveId }: { liveId: string }) {
 function AnswerForm({
   activity,
   disabled,
+  revealed,
   onSubmit
 }: {
   activity: ActivityRecord;
   disabled: boolean;
+  revealed: boolean;
   onSubmit: (answer: unknown) => void;
 }) {
   const [selected, setSelected] = useState("");
   const [text, setText] = useState("");
+  const correctId = correctOptionId(activity.correctAnswer);
 
   useEffect(() => {
     setSelected("");
@@ -1098,18 +1173,27 @@ function AnswerForm({
       }}
     >
       <div className="choice-list">
-        {activity.options.map((option) => (
-          <label className="choice" key={option.id}>
-            <input
-              type="radio"
-              name={activity.id}
-              checked={selected === option.id}
-              disabled={disabled}
-              onChange={() => setSelected(option.id)}
-            />
-            <span>{option.label}</span>
-          </label>
-        ))}
+        {activity.options.map((option) => {
+          const isCorrect = revealed && correctId === option.id;
+          return (
+            <label
+              className={`choice${isCorrect ? " correct" : ""}`}
+              key={option.id}
+            >
+              <input
+                type="radio"
+                name={activity.id}
+                checked={selected === option.id}
+                disabled={disabled}
+                onChange={() => setSelected(option.id)}
+              />
+              <span>
+                {option.label}
+                {isCorrect ? <em> 正解</em> : null}
+              </span>
+            </label>
+          );
+        })}
       </div>
       <button disabled={disabled || !selected}>{disabled ? "已送出" : "送出答案"}</button>
     </form>
@@ -1182,6 +1266,9 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
 
   const currentActivity = state?.currentActivity ?? null;
   const answered = Boolean(localResponse);
+  const remaining = useServerCountdown(state);
+  const revealed = Boolean(state?.answerRevealed);
+  const timeUp = remaining === 0 || revealed;
   const sortedMessages = useMemo(
     () => [...messages].sort((a, b) => Number(a.pinned !== b.pinned) * (a.pinned ? -1 : 1)),
     [messages]
@@ -1213,10 +1300,16 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
             <div className="question-block">
               <h2>{currentActivity.title}</h2>
               <p>{currentActivity.description}</p>
+              {remaining !== null ? (
+                <div className={`countdown${timeUp ? " ended" : ""}`}>
+                  {timeUp ? "時間到" : `剩餘 ${remaining} 秒`}
+                </div>
+              ) : null}
             </div>
             <AnswerForm
               activity={currentActivity}
-              disabled={answered || state?.liveSession.status === "ended"}
+              disabled={answered || timeUp || state?.liveSession.status === "ended"}
+              revealed={revealed}
               onSubmit={(answer) => {
                 const sent = socket.send("submit_answer", {
                   activityId: currentActivity.id,
@@ -1225,10 +1318,16 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
                 if (sent) setLocalResponse({} as ResponseRecord);
               }}
             />
-            {state?.liveSession.showResults ? (
+            {revealed && currentActivity.explanation ? (
+              <section className="results-panel explanation-panel">
+                <h2>詳解</h2>
+                <p>{currentActivity.explanation}</p>
+              </section>
+            ) : null}
+            {revealed || state?.liveSession.showResults ? (
               <section className="results-panel">
                 <h2>結果</h2>
-                <SummaryView summary={state.responseSummary} />
+                <SummaryView summary={state?.responseSummary ?? null} />
               </section>
             ) : null}
           </>

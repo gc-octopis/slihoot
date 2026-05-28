@@ -21,6 +21,8 @@ export interface ActivityRecord {
   type: ActivityType;
   title: string;
   description: string;
+  explanation: string;
+  timeLimitSeconds: number;
   options: ActivityOption[];
   correctAnswer: unknown;
   sortOrder: number;
@@ -43,6 +45,7 @@ export interface LiveSessionRecord {
   status: LiveStatus;
   currentActivityId: string | null;
   currentActivityIndex: number;
+  currentActivityStartedAt: string | null;
   showResults: boolean;
   showParticipantNames: boolean;
   startedAt: string | null;
@@ -104,6 +107,8 @@ export interface LiveState {
   currentActivity: ActivityRecord | null;
   participantCount: number;
   responseSummary: ResponseSummary | null;
+  serverNow: string;
+  answerRevealed: boolean;
   me?: ParticipantRecord | null;
   myResponse?: ResponseRecord | null;
 }

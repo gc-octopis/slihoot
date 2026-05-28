@@ -61,6 +61,7 @@ interface SocketClient {
 const clients = new Map<string, SocketClient>();
 const rooms = new Map<string, Set<string>>();
 const messageRateLimits = new Map<string, number>();
+const revealTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function socketId() {
   return crypto.randomUUID();
@@ -120,6 +121,35 @@ async function broadcastState(liveId: string) {
       });
     }
   }
+}
+
+async function scheduleReveal(liveId: string) {
+  const existing = revealTimers.get(liveId);
+  if (existing) clearTimeout(existing);
+  revealTimers.delete(liveId);
+
+  const liveSession = await getLiveSession(liveId);
+  if (
+    !liveSession ||
+    liveSession.status === "ended" ||
+    !liveSession.currentActivityId ||
+    !liveSession.currentActivityStartedAt
+  ) {
+    return;
+  }
+
+  const activity = await getActivity(liveSession.currentActivityId);
+  if (!activity || activity.timeLimitSeconds <= 0) return;
+
+  const startedMs = new Date(liveSession.currentActivityStartedAt).getTime();
+  const remaining = activity.timeLimitSeconds * 1000 - (Date.now() - startedMs);
+  if (remaining <= 0) return;
+
+  const timer = setTimeout(() => {
+    revealTimers.delete(liveId);
+    broadcastState(liveId).catch(() => {});
+  }, remaining + 50);
+  revealTimers.set(liveId, timer);
 }
 
 async function broadcastParticipantCount(liveId: string) {
@@ -218,6 +248,7 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       const payload = message.payload as any;
       await setCurrentActivity(client.liveId, String(payload.activityId ?? ""));
       await broadcastState(client.liveId);
+      await scheduleReveal(client.liveId);
       return;
     }
 
@@ -457,6 +488,7 @@ app.get(
             const client: SocketClient = { id: clientId, liveId, role, ws };
             addClient(client);
             await broadcastState(liveId);
+            await scheduleReveal(liveId);
             return;
           }
 
@@ -477,6 +509,7 @@ app.get(
           addClient(client);
           await broadcastState(liveId);
           await broadcastParticipantCount(liveId);
+          await scheduleReveal(liveId);
         } catch (error) {
           ws.send(
             JSON.stringify({

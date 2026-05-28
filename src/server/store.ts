@@ -137,6 +137,8 @@ function rowToActivity(row: any): ActivityRecord {
     type: row.type,
     title: row.title,
     description: row.description ?? "",
+    explanation: row.explanation ?? "",
+    timeLimitSeconds: Number(row.timeLimitSeconds ?? 0),
     options: parseJson<ActivityOption[]>(row.optionsJson, []),
     correctAnswer: parseJson(row.correctAnswerJson, null),
     sortOrder: Number(row.sortOrder ?? 0),
@@ -153,6 +155,7 @@ function rowToLiveSession(row: any): LiveSessionRecord {
     status: row.status,
     currentActivityId: row.currentActivityId,
     currentActivityIndex: Number(row.currentActivityIndex ?? 0),
+    currentActivityStartedAt: row.currentActivityStartedAt ? toIso(row.currentActivityStartedAt) : null,
     showResults: Boolean(row.showResults),
     showParticipantNames: Boolean(row.showParticipantNames),
     startedAt: row.startedAt ? toIso(row.startedAt) : null,
@@ -203,8 +206,15 @@ function rowToMessage(row: any): LiveMessageRecord {
 export function publicActivity(activity: ActivityRecord): ActivityRecord {
   return {
     ...activity,
+    explanation: "",
     correctAnswer: null
   };
+}
+
+function clampTimeLimit(value: unknown) {
+  const seconds = Math.floor(Number(value));
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  return Math.min(seconds, 3600);
 }
 
 export async function listEvents() {
@@ -325,6 +335,8 @@ export async function listActivities(eventId: string) {
       type,
       title,
       description,
+      explanation,
+      time_limit_seconds AS timeLimitSeconds,
       options_json AS optionsJson,
       correct_answer_json AS correctAnswerJson,
       sort_order AS sortOrder,
@@ -344,6 +356,8 @@ export async function createActivity(
     type: unknown;
     title: unknown;
     description?: unknown;
+    explanation?: unknown;
+    timeLimitSeconds?: unknown;
     options?: unknown;
     correctAnswer?: unknown;
   }
@@ -351,10 +365,17 @@ export async function createActivity(
   const type = assertActivityType(input.type);
   const title = normalizeText(input.title, 200) || "未命名題目";
   const description = normalizeText(input.description, 2000);
+  const explanation = normalizeText(input.explanation, 2000);
+  const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
   if (type === "multiple_choice" && options.length < 2) {
     throw new Error("Multiple choice activities need at least two options.");
+  }
+
+  const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
+  if (type !== "short_answer" && !correctAnswer) {
+    throw new Error("請先設定正確答案再新增題目。");
   }
 
   const [maxRows] = await pool.execute(
@@ -366,17 +387,19 @@ export async function createActivity(
 
   await pool.execute(
     `INSERT INTO activities
-      (id, event_id, type, title, description, options_json, correct_answer_json, sort_order)
+      (id, event_id, type, title, description, explanation, time_limit_seconds, options_json, correct_answer_json, sort_order)
      VALUES
-      (:id, :eventId, :type, :title, :description, :optionsJson, :correctAnswerJson, :sortOrder)`,
+      (:id, :eventId, :type, :title, :description, :explanation, :timeLimitSeconds, :optionsJson, :correctAnswerJson, :sortOrder)`,
     {
       id: activityId,
       eventId,
       type,
       title,
       description,
+      explanation,
+      timeLimitSeconds,
       optionsJson: stringifyJson(options),
-      correctAnswerJson: stringifyJson(normalizeCorrectAnswer(type, options, input.correctAnswer)),
+      correctAnswerJson: stringifyJson(correctAnswer),
       sortOrder
     }
   );
@@ -392,6 +415,8 @@ export async function getActivity(activityId: string) {
       type,
       title,
       description,
+      explanation,
+      time_limit_seconds AS timeLimitSeconds,
       options_json AS optionsJson,
       correct_answer_json AS correctAnswerJson,
       sort_order AS sortOrder,
@@ -411,6 +436,8 @@ export async function updateActivity(
     type: unknown;
     title: unknown;
     description?: unknown;
+    explanation?: unknown;
+    timeLimitSeconds?: unknown;
     options?: unknown;
     correctAnswer?: unknown;
   }
@@ -418,10 +445,17 @@ export async function updateActivity(
   const type = assertActivityType(input.type);
   const title = normalizeText(input.title, 200) || "未命名題目";
   const description = normalizeText(input.description, 2000);
+  const explanation = normalizeText(input.explanation, 2000);
+  const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
   if (type === "multiple_choice" && options.length < 2) {
     throw new Error("Multiple choice activities need at least two options.");
+  }
+
+  const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
+  if (type !== "short_answer" && !correctAnswer) {
+    throw new Error("請先設定正確答案再儲存題目。");
   }
 
   await pool.execute(
@@ -429,6 +463,8 @@ export async function updateActivity(
      SET type = :type,
          title = :title,
          description = :description,
+         explanation = :explanation,
+         time_limit_seconds = :timeLimitSeconds,
          options_json = :optionsJson,
          correct_answer_json = :correctAnswerJson
      WHERE id = :activityId`,
@@ -437,8 +473,10 @@ export async function updateActivity(
       type,
       title,
       description,
+      explanation,
+      timeLimitSeconds,
       optionsJson: stringifyJson(options),
-      correctAnswerJson: stringifyJson(normalizeCorrectAnswer(type, options, input.correctAnswer))
+      correctAnswerJson: stringifyJson(correctAnswer)
     }
   );
 
@@ -507,14 +545,15 @@ export async function startLiveSession(eventId: string) {
 
   await pool.execute(
     `INSERT INTO live_sessions
-      (id, event_id, join_code, status, current_activity_id, current_activity_index, show_results, started_at)
+      (id, event_id, join_code, status, current_activity_id, current_activity_index, current_activity_started_at, show_results, started_at)
      VALUES
-      (:id, :eventId, :joinCode, 'active', :currentActivityId, 0, FALSE, :startedAt)`,
+      (:id, :eventId, :joinCode, 'active', :currentActivityId, 0, :currentActivityStartedAt, FALSE, :startedAt)`,
     {
       id: liveId,
       eventId,
       joinCode,
       currentActivityId: firstActivity?.id ?? null,
+      currentActivityStartedAt: firstActivity ? nowDate() : null,
       startedAt: nowDate()
     }
   );
@@ -531,6 +570,7 @@ export async function getLiveSession(liveId: string) {
       status,
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
+      current_activity_started_at AS currentActivityStartedAt,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -565,9 +605,10 @@ export async function setCurrentActivity(liveId: string, activityId: string) {
     `UPDATE live_sessions
      SET current_activity_id = :activityId,
          current_activity_index = :activityIndex,
+         current_activity_started_at = :startedAt,
          show_results = FALSE
      WHERE id = :liveId`,
-    { liveId, activityId, activityIndex: index }
+    { liveId, activityId, activityIndex: index, startedAt: nowDate() }
   );
 
   return getLiveSession(liveId);
@@ -600,6 +641,7 @@ export async function joinLiveSession(input: { joinCode: unknown; nickname: unkn
       status,
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
+      current_activity_started_at AS currentActivityStartedAt,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -864,8 +906,16 @@ export async function getLiveState(
     activities[liveSession.currentActivityIndex] ??
     null;
 
+  const answerRevealed = Boolean(
+    currentActivity &&
+      currentActivity.timeLimitSeconds > 0 &&
+      liveSession.currentActivityStartedAt &&
+      Date.now() - new Date(liveSession.currentActivityStartedAt).getTime() >=
+        currentActivity.timeLimitSeconds * 1000
+  );
+
   const responseSummary =
-    currentActivity && (viewer === "admin" || liveSession.showResults)
+    currentActivity && (viewer === "admin" || liveSession.showResults || answerRevealed)
       ? await getResponseSummary(liveId, currentActivity, {
           includeResponses: viewer === "admin",
           includeParticipantNames: viewer === "admin" && liveSession.showParticipantNames
@@ -888,12 +938,14 @@ export async function getLiveState(
     },
     activities: viewer === "admin" ? activities : undefined,
     currentActivity: currentActivity
-      ? viewer === "admin"
+      ? viewer === "admin" || answerRevealed
         ? currentActivity
         : publicActivity(currentActivity)
       : null,
     participantCount: await countParticipants(liveId),
     responseSummary,
+    serverNow: new Date().toISOString(),
+    answerRevealed,
     me: participantId ? await getParticipant(participantId) : undefined,
     myResponse
   };

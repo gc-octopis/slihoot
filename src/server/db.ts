@@ -118,4 +118,22 @@ export async function migrate() {
     "show_participant_names",
     "show_participant_names BOOLEAN NOT NULL DEFAULT FALSE AFTER show_results"
   );
+
+  await addColumnIfMissing(
+    "live_sessions",
+    "current_activity_started_at",
+    "current_activity_started_at DATETIME NULL AFTER current_activity_index"
+  );
+
+  await addColumnIfMissing(
+    "activities",
+    "explanation",
+    "explanation TEXT NULL AFTER description"
+  );
+
+  await addColumnIfMissing(
+    "activities",
+    "time_limit_seconds",
+    "time_limit_seconds INT NOT NULL DEFAULT 0 AFTER explanation"
+  );
 }
