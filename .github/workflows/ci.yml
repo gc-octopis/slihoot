@@ -38,3 +38,33 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  e2e:
+    name: Smoke e2e (docker compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Start stack (mysql + redis + app)
+        run: docker compose up -d --build mysql redis app
+      - name: Wait for app health
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/healthz || true)
+            if [ "$code" = "200" ]; then echo "app healthy after ${i} tries"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::app did not become healthy"; docker compose logs app; exit 1
+      - name: Run smoke test
+        run: bun scripts/smoke.ts
+        env:
+          BASE_URL: http://127.0.0.1:3000
+          ADMIN_PASSWORD: change-me
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

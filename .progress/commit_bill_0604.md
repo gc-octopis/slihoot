@@ -136,6 +136,15 @@
 ### GCP 部署教學(自架 Docker,不用託管服務)
 - 步驟:建 VM(建議 n4-standard-2,Hyperdisk;e2-small 也夠)→ 防火牆只開 80/443/22 → 裝 Docker + clone 到 `/opt/slihoot` → 用 `openssl` 產生強密碼寫入 `.env` → `scripts/startup.sh` 起整套 → 設 DNS A record + `DOMAIN` 由 Caddy 自動 HTTPS → `/healthz` 驗證。
 
+### Smoke e2e 測試 + 日誌防爆
+- 新增 `scripts/smoke.ts`(`bun run smoke`):驅動真實 stack 走 happy path 並 assert —— healthz(mysql+redis)→ admin 登入 → 建活動 → 開場 → admin 開始題目 → 參與者加入 → 送答案 → 確認 `answer_recorded` + admin state 的在線數/答題數。失敗回非 0。本機實測通過。
+- `ci.yml` 新增 `e2e` job:`docker compose up -d --build mysql redis app` → 等 `/healthz` → 跑 smoke → teardown。失敗會讓 CI 紅燈,進而**擋掉自動部署**(deploy 只在 CI 成功後觸發)。
+- 日誌防爆(避免 VM 磁碟被塞爆):
+  1. `index.ts` logger **跳過 `/healthz`**(每 10s 的 healthcheck 不再記一行)。
+  2. compose 既有 per-service log rotation(`json-file` 10m×3)。
+  3. (VM 端)建議在 `/etc/docker/daemon.json` 加全域 log 上限,連未來其他容器都保護。
+  4. `deploy.yml` 的 `docker image prune -f` 避免每次 rebuild 累積舊 image。
+
 ### 重開機自動重啟(本次重點需求)
 - 新增 `deploy/slihoot.service`(systemd oneshot + `RemainAfterExit`):開機時 `docker compose up -d --build`,停機 `down`。`systemctl enable` 後重開機整套自動回來。
 - 兩層機制:**systemd unit = 重開機恢復的主要保證(不依賴 Docker restart policy)**;`restart: unless-stopped` = VM 不重開時的當機自動拉回。

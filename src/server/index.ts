@@ -587,7 +587,9 @@ async function participantFromRequest(c: Context) {
   return authenticateParticipant(token);
 }
 
-app.use("*", logger());
+// Skip the every-10s /healthz probe to keep request logs (and disk) low-noise.
+const requestLogger = logger();
+app.use("*", (c, next) => (c.req.path === "/healthz" ? next() : requestLogger(c, next)));
 
 app.use(
   "*",
