@@ -1274,9 +1274,15 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const autoTunnelAttemptRef = useRef<string | null>(null);
 
   const joinCode = state?.liveSession.joinCode ?? "";
+  // On a real public domain (e.g. https://slihoot.me) the page's own origin is
+  // already shareable, so the join link should just use it. The Cloudflare
+  // tunnel is only needed for local dev where the origin is localhost.
+  const isLocalhostOrigin = ["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(
+    window.location.hostname
+  );
   const effectiveBaseUrl = useMemo(() => {
     const tunnelUrl = tryTunnel?.status === "running" ? tryTunnel.publicUrl : null;
-    return tunnelUrl ?? "";
+    return tunnelUrl ?? window.location.origin;
   }, [tryTunnel?.publicUrl, tryTunnel?.status]);
   const joinUrl = useMemo(() => {
     if (!joinCode) return "";
@@ -1339,12 +1345,14 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   useEffect(() => {
     if (!token) return;
     if (!joinCode) return;
+    // Public/LAN origin is already shareable — only auto-start a tunnel on localhost.
+    if (!isLocalhostOrigin) return;
     if (tryTunnel?.status === "running" || tryTunnel?.status === "starting") return;
     if (autoTunnelAttemptRef.current === joinCode) return;
 
     autoTunnelAttemptRef.current = joinCode;
     startTryTunnel();
-  }, [joinCode, startTryTunnel, token, tryTunnel?.status]);
+  }, [isLocalhostOrigin, joinCode, startTryTunnel, token, tryTunnel?.status]);
 
   const copyJoinUrl = useCallback(async () => {
     if (!joinUrl) return;
@@ -1357,12 +1365,12 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const openJoinQr = useCallback(() => {
     const dialog = qrDialogRef.current;
     if (!dialog) return;
-    if (tryTunnel?.status !== "running" && tryTunnel?.status !== "starting") {
+    if (isLocalhostOrigin && tryTunnel?.status !== "running" && tryTunnel?.status !== "starting") {
       startTryTunnel();
     }
     if (dialog.open) return;
     dialog.showModal();
-  }, [startTryTunnel, tryTunnel?.status]);
+  }, [isLocalhostOrigin, startTryTunnel, tryTunnel?.status]);
 
   const load = useCallback(async () => {
     if (!token) return;
