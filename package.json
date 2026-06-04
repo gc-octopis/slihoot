@@ -8,6 +8,7 @@
     "dev:web": "bunx vite --host 0.0.0.0",
     "build": "bunx vite build",
     "start": "bun src/server/index.ts",
+    "loadtest": "bun scripts/loadtest.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {

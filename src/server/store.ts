@@ -12,8 +12,49 @@ import type {
   ResponseSummary
 } from "./types";
 import { pool } from "./db";
+import { cacheDel, cacheGet, cacheSet, presenceCount } from "./redis";
 
 const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_answer", "word_cloud"];
+
+// --- Redis cache layer -----------------------------------------------------
+// Only shared, viewer-agnostic, expensive reads are cached. Live-session state
+// itself is intentionally NOT cached (cheap PK lookups, and it is the source of
+// truth for the live UI). Every entry has a short TTL as a safety net on top of
+// explicit invalidation on writes.
+const ACTIVITIES_TTL = 10;
+const EVENT_TTL = 10;
+const SUMMARY_TTL = 3;
+
+// Presence freshness window. A connected participant is refreshed well within
+// this window by the server-side heartbeat (see index.ts), so a member only
+// falls out of the online set after the connection is actually gone.
+export const PRESENCE_TTL_SECONDS = 90;
+
+function activitiesKey(eventId: string) {
+  return `cache:activities:${eventId}`;
+}
+
+function eventKey(eventId: string) {
+  return `cache:event:${eventId}`;
+}
+
+function summaryKey(
+  liveId: string,
+  activityId: string,
+  includeResponses: boolean,
+  includeParticipantNames: boolean
+) {
+  return `cache:summary:${liveId}:${activityId}:${includeResponses ? 1 : 0}:${includeParticipantNames ? 1 : 0}`;
+}
+
+function summaryKeysFor(liveId: string, activityId: string) {
+  return [
+    summaryKey(liveId, activityId, true, true),
+    summaryKey(liveId, activityId, true, false),
+    summaryKey(liveId, activityId, false, true),
+    summaryKey(liveId, activityId, false, false)
+  ];
+}
 
 function id() {
   return crypto.randomUUID();
@@ -297,17 +338,34 @@ export async function createEvent(input: { title: unknown; description?: unknown
 }
 
 export async function getEvent(eventId: string) {
-  const [rows] = await pool.execute(
-    `SELECT id, title, description, created_at AS createdAt, updated_at AS updatedAt
-     FROM events WHERE id = :eventId`,
-    { eventId }
-  );
-  const row = (rows as any[])[0];
-  if (!row) return null;
+  const key = eventKey(eventId);
+  let base: EventRecord | null = null;
 
+  const cached = await cacheGet(key);
+  if (cached) {
+    try {
+      base = JSON.parse(cached) as EventRecord;
+    } catch {
+      base = null;
+    }
+  }
+
+  if (!base) {
+    const [rows] = await pool.execute(
+      `SELECT id, title, description, created_at AS createdAt, updated_at AS updatedAt
+       FROM events WHERE id = :eventId`,
+      { eventId }
+    );
+    const row = (rows as any[])[0];
+    if (!row) return null;
+    base = rowToEvent(row);
+    await cacheSet(key, JSON.stringify(base), EVENT_TTL);
+  }
+
+  // Activities are cached independently via listActivities().
   const activities = await listActivities(eventId);
   return {
-    ...rowToEvent(row),
+    ...base,
     activities
   };
 }
@@ -326,15 +384,27 @@ export async function updateEvent(
       description
     }
   );
+  await cacheDel(eventKey(eventId));
   return getEvent(eventId);
 }
 
 export async function deleteEvent(eventId: string) {
   const [result] = await pool.execute(`DELETE FROM events WHERE id = :eventId`, { eventId });
+  await cacheDel(eventKey(eventId), activitiesKey(eventId));
   return (result as any).affectedRows > 0;
 }
 
-export async function listActivities(eventId: string) {
+export async function listActivities(eventId: string): Promise<ActivityRecord[]> {
+  const key = activitiesKey(eventId);
+  const cached = await cacheGet(key);
+  if (cached) {
+    try {
+      return JSON.parse(cached) as ActivityRecord[];
+    } catch {
+      /* fall through to DB */
+    }
+  }
+
   const [rows] = await pool.execute(
     `SELECT
       id,
@@ -354,7 +424,9 @@ export async function listActivities(eventId: string) {
     ORDER BY sort_order ASC, created_at ASC`,
     { eventId }
   );
-  return (rows as any[]).map(rowToActivity);
+  const activities = (rows as any[]).map(rowToActivity);
+  await cacheSet(key, JSON.stringify(activities), ACTIVITIES_TTL);
+  return activities;
 }
 
 export async function createActivity(
@@ -411,6 +483,7 @@ export async function createActivity(
     }
   );
 
+  await cacheDel(activitiesKey(eventId));
   return getActivity(activityId);
 }
 
@@ -487,13 +560,17 @@ export async function updateActivity(
     }
   );
 
-  return getActivity(activityId);
+  const updated = await getActivity(activityId);
+  if (updated) await cacheDel(activitiesKey(updated.eventId));
+  return updated;
 }
 
 export async function deleteActivity(activityId: string) {
+  const existing = await getActivity(activityId);
   const [result] = await pool.execute(`DELETE FROM activities WHERE id = :activityId`, {
     activityId
   });
+  if (existing) await cacheDel(activitiesKey(existing.eventId));
   return (result as any).affectedRows > 0;
 }
 
@@ -515,6 +592,7 @@ export async function reorderActivities(eventId: string, activityIds: string[]) 
     connection.release();
   }
 
+  await cacheDel(activitiesKey(eventId));
   return listActivities(eventId);
 }
 
@@ -764,6 +842,11 @@ export async function touchParticipant(participantId: string) {
 }
 
 export async function countParticipants(liveId: string) {
+  // Prefer the live "currently online" count from Redis presence.
+  const online = await presenceCount(liveId, PRESENCE_TTL_SECONDS);
+  if (online !== null) return online;
+
+  // Redis unavailable: fall back to the cumulative join count from MySQL.
   const [rows] = await pool.execute(
     `SELECT COUNT(*) AS total FROM participants WHERE live_session_id = :liveId`,
     { liveId }
@@ -853,6 +936,8 @@ export async function submitAnswer(input: {
     }
   );
 
+  await cacheDel(...summaryKeysFor(input.liveId, input.activityId));
+
   return getResponse(input.liveId, input.activityId, input.participantId);
 }
 
@@ -882,6 +967,32 @@ export async function getResponse(
 }
 
 export async function getResponseSummary(
+  liveId: string,
+  activity: ActivityRecord,
+  options: { includeResponses?: boolean; includeParticipantNames?: boolean } = {}
+): Promise<ResponseSummary> {
+  const includeResponses = Boolean(options.includeResponses);
+  const includeParticipantNames = Boolean(options.includeParticipantNames);
+  const key = summaryKey(liveId, activity.id, includeResponses, includeParticipantNames);
+
+  const cached = await cacheGet(key);
+  if (cached) {
+    try {
+      return JSON.parse(cached) as ResponseSummary;
+    } catch {
+      /* fall through to recompute */
+    }
+  }
+
+  const result = await computeResponseSummary(liveId, activity, {
+    includeResponses,
+    includeParticipantNames
+  });
+  await cacheSet(key, JSON.stringify(result), SUMMARY_TTL);
+  return result;
+}
+
+async function computeResponseSummary(
   liveId: string,
   activity: ActivityRecord,
   options: { includeResponses?: boolean; includeParticipantNames?: boolean } = {}

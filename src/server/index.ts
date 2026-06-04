@@ -1,12 +1,21 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
+import { logger } from "hono/logger";
 import { createBunWebSocket, serveStatic } from "hono/bun";
 import { readdir } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { env, assertRuntimeConfig } from "./env";
-import { migrate } from "./db";
+import { migrate, pool } from "./db";
+import {
+  closeRedis,
+  presenceRemove,
+  presenceTouch,
+  rateLimitHit,
+  redisEnabled,
+  redisPing
+} from "./redis";
 import {
   isAdminRequest,
   issueAdminToken,
@@ -32,6 +41,7 @@ import {
   listEvents,
   listMessages,
   moderateMessage,
+  PRESENCE_TTL_SECONDS,
   reorderActivities,
   setCurrentActivity,
   startActivity,
@@ -64,7 +74,6 @@ interface SocketClient {
 
 const clients = new Map<string, SocketClient>();
 const rooms = new Map<string, Set<string>>();
-const messageRateLimits = new Map<string, number>();
 const revealTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 type TryCloudflareTunnelStatus = "stopped" | "starting" | "running" | "error";
@@ -303,6 +312,16 @@ function removeClient(clientId: string) {
   if (room?.size === 0) rooms.delete(client.liveId);
 }
 
+function handleDisconnect(clientId: string) {
+  const client = clients.get(clientId);
+  removeClient(clientId);
+  if (client?.participantId) {
+    void presenceRemove(client.liveId, client.participantId)
+      .then(() => broadcastParticipantCount(client.liveId))
+      .catch(() => {});
+  }
+}
+
 function send(client: SocketClient, message: SocketMessage) {
   client.ws.send(JSON.stringify(message));
 }
@@ -451,6 +470,9 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "participant" || !client.participantId) {
         throw new Error("Only participants can submit answers.");
       }
+      if (!(await allowRateLimit(`rl:ans:${client.participantId}`, 10, 5))) {
+        throw new Error("作答太頻繁,請稍候再試。");
+      }
       const payload = message.payload as any;
       const response = await submitAnswer({
         liveId: client.liveId,
@@ -502,11 +524,9 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "participant" || !client.participantId) {
         throw new Error("Only participants can send messages.");
       }
-      const lastSentAt = messageRateLimits.get(client.participantId) ?? 0;
-      if (Date.now() - lastSentAt < 2000) {
+      if (!(await allowRateLimit(`rl:msg:${client.participantId}`, 1, 2))) {
         throw new Error("Please wait before sending another message.");
       }
-      messageRateLimits.set(client.participantId, Date.now());
       const payload = message.payload as any;
       const newMessage = await createMessage({
         liveId: client.liveId,
@@ -567,6 +587,8 @@ async function participantFromRequest(c: Context) {
   return authenticateParticipant(token);
 }
 
+app.use("*", logger());
+
 app.use(
   "*",
   cors({
@@ -576,6 +598,22 @@ app.use(
     credentials: true
   })
 );
+
+function clientIp(c: Context) {
+  const forwarded = c.req.header("x-forwarded-for");
+  if (forwarded) return forwarded.split(",")[0]!.trim();
+  return c.req.header("x-real-ip") ?? "unknown";
+}
+
+/**
+ * Fixed-window rate limit backed by Redis. Returns true when the request is
+ * allowed. Fails open (allows) when Redis is unavailable — rate limiting is an
+ * optimisation/abuse-control layer, not a hard dependency.
+ */
+async function allowRateLimit(key: string, limit: number, windowSeconds: number) {
+  const count = await rateLimitHit(key, windowSeconds);
+  return count === null || count <= limit;
+}
 
 app.get("/api/health", (c) => c.json({ ok: true, name: "slihoot" }));
 
@@ -725,6 +763,9 @@ app.post("/api/live-sessions/:liveId/end", requireAdmin, async (c) =>
 
 app.post("/api/live-sessions/join", async (c) =>
   routeJson(c, async () => {
+    if (!(await allowRateLimit(`rl:join:${clientIp(c)}`, env.rateLimit.joinPerMinute, 60))) {
+      throw new Error("加入太頻繁,請稍候再試。");
+    }
     const joined = await joinLiveSession(await readBody(c));
     if (!joined) throw new Error("Live session not found.");
     return joined;
@@ -788,6 +829,7 @@ app.get(
             participantName: participant.nickname
           };
           addClient(client);
+          await presenceTouch(liveId, participant.id, PRESENCE_TTL_SECONDS);
           await broadcastState(liveId);
           await broadcastParticipantCount(liveId);
           await scheduleReveal(liveId);
@@ -815,14 +857,34 @@ app.get(
         }
       },
       onClose() {
-        removeClient(clientId);
+        handleDisconnect(clientId);
       },
       onError() {
-        removeClient(clientId);
+        handleDisconnect(clientId);
       }
     };
   })
 );
+
+app.get("/healthz", async (c) => {
+  const checks = { mysql: false, redis: false };
+
+  try {
+    await pool.query("SELECT 1");
+    checks.mysql = true;
+  } catch {
+    checks.mysql = false;
+  }
+
+  checks.redis = redisEnabled ? await redisPing() : false;
+
+  // MySQL is the hard dependency; Redis is an optional optimisation layer.
+  const ok = checks.mysql;
+  return c.json(
+    { status: ok ? "ok" : "degraded", redisEnabled, checks },
+    ok ? 200 : 503
+  );
+});
 
 app.use("/assets/*", serveStatic({ root: "./dist" }));
 app.get("*", serveStatic({ root: "./dist", path: "index.html" }));
@@ -834,10 +896,60 @@ if (env.autoMigrate) {
   console.log("[slihoot] database migrations are up to date.");
 }
 
-Bun.serve({
+// Presence heartbeat: refresh the online TTL for every connected participant so
+// Redis presence reflects live connections without requiring client changes.
+const heartbeat = setInterval(() => {
+  for (const client of clients.values()) {
+    if (client.participantId) {
+      void presenceTouch(client.liveId, client.participantId, PRESENCE_TTL_SECONDS);
+    }
+  }
+}, 30_000);
+
+const server = Bun.serve({
   port: env.port,
   fetch: app.fetch,
   websocket
 });
+
+// Graceful shutdown: on SIGTERM/SIGINT (e.g. `docker compose stop` or a deploy
+// restart), stop accepting connections and release MySQL/Redis cleanly so we
+// don't drop sockets mid-write or leak pooled connections.
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[slihoot] received ${signal}, shutting down gracefully...`);
+
+  clearInterval(heartbeat);
+  for (const timer of revealTimers.values()) clearTimeout(timer);
+  revealTimers.clear();
+
+  for (const client of clients.values()) {
+    try {
+      client.ws.close(1001, "server shutting down");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  try {
+    await server.stop(true);
+  } catch {
+    /* ignore */
+  }
+  try {
+    await pool.end();
+  } catch {
+    /* ignore */
+  }
+  closeRedis();
+
+  console.log("[slihoot] shutdown complete.");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 console.log(`[slihoot] listening on http://localhost:${env.port}`);

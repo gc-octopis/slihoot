@@ -1,0 +1,17 @@
+[Unit]
+Description=slihoot live interaction app (docker compose stack)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adjust if you checked the repo out somewhere other than /opt/slihoot.
+WorkingDirectory=/opt/slihoot
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

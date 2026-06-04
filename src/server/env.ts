@@ -10,6 +10,17 @@ export const env = {
     password: Bun.env.DB_PASSWORD ?? "slihoot",
     database: Bun.env.DB_NAME ?? "slihoot"
   },
+  redis: {
+    url: Bun.env.REDIS_URL ?? "",
+    enabled: Boolean(Bun.env.REDIS_URL)
+  },
+  rateLimit: {
+    // Per-IP join cap. Kept generous on purpose: an in-room audience often
+    // shares one NAT/Wi-Fi egress IP, so many legitimate joins come from the
+    // same address. High enough for a full room, low enough to stop a script
+    // hammering thousands of fake joins.
+    joinPerMinute: Number(Bun.env.RATE_LIMIT_JOIN_PER_MIN ?? 300)
+  },
   autoMigrate: (Bun.env.DB_AUTO_MIGRATE ?? "true") !== "false"
 };
 
