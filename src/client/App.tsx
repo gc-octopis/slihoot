@@ -1089,6 +1089,11 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     if (!token || !event) return;
     const activeEvent = await ensureEventRecord();
     if (!activeEvent) return;
+    // 限時開著就一定要填秒數；空白 → 提醒（要不限時請關閉「限時」拉桿，送出 0）。
+    if (draft.hasTimeLimit && (!draft.timeLimitSeconds || draft.timeLimitSeconds < 1)) {
+      window.alert("請輸入作答秒數，或關閉「限時」改為不限時。");
+      return;
+    }
     try {
       if (editingId) {
         await api(`/api/activities/${editingId}`, {
@@ -1508,16 +1513,19 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                               min={1}
                               max={3600}
                               disabled={!draft.hasTimeLimit}
-                              value={draft.timeLimitSeconds || 30}
-                              onChange={(change) =>
+                              value={draft.timeLimitSeconds || ""}
+                              onChange={(change) => {
+                                // Allow the field to be cleared (0/blank) so the
+                                // user can leave it empty — saveActivity then
+                                // alerts instead of silently defaulting.
+                                const raw = Math.floor(Number(change.target.value));
                                 setDraft({
                                   ...draft,
-                                  timeLimitSeconds: Math.max(
-                                    1,
-                                    Math.min(3600, Number(change.target.value) || 30)
-                                  )
-                                })
-                              }
+                                  timeLimitSeconds: Number.isFinite(raw)
+                                    ? Math.min(3600, Math.max(0, raw))
+                                    : 0
+                                });
+                              }}
                             />
                             <span className="seconds-suffix">秒</span>
                           </span>
@@ -2612,6 +2620,9 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const hasCurrentActivity = Boolean(state?.currentActivity);
   const activityOpen = Boolean(state?.activityOpen);
   const answerClosed = Boolean(state?.answerClosed);
+  // Timed questions reveal results automatically when the clock runs out, so
+  // only untimed questions need a manual "顯示結果" (reveal + close answering) button.
+  const isTimedActivity = (state?.currentActivity?.timeLimitSeconds ?? 0) > 0;
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
@@ -2767,22 +2778,18 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               下一頁
             </button>
             <button
-              hidden={!hasCurrentActivity || isWordCloudActivity}
-              disabled={!socket.connected || (remaining !== null && remaining > 0)}
+              hidden={!hasCurrentActivity || isWordCloudActivity || isTimedActivity}
+              disabled={!socket.connected || Boolean(state?.liveSession.showResults)}
               title={
                 !socket.connected
                   ? "連線中，請稍候"
-                  : remaining !== null && remaining > 0
-                    ? "倒數結束後才能公布結果"
-                    : undefined
+                  : state?.liveSession.showResults
+                    ? "答案已公布，本題作答已結束"
+                    : "公布答案並結束本題作答"
               }
-              onClick={() =>
-                socket.send("set_results_visibility", {
-                  showResults: !state?.liveSession.showResults
-                })
-              }
+              onClick={() => socket.send("set_results_visibility", { showResults: true })}
             >
-              {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
+              公布答案
             </button>
             <button
               hidden={!hasCurrentActivity || isWordCloudActivity}
