@@ -868,6 +868,9 @@ export async function createActivity(
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
+  if (timeLimitSeconds <= 0) {
+    throw new Error("請設定作答秒數（需大於 0）。");
+  }
   const options = normalizeOptions(type, input.options);
 
   if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
@@ -976,6 +979,9 @@ export async function updateActivity(
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
+  if (timeLimitSeconds <= 0) {
+    throw new Error("請設定作答秒數（需大於 0）。");
+  }
   const options = normalizeOptions(type, input.options);
 
   if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
@@ -1701,8 +1707,14 @@ async function computeResponseSummary(
         : [];
     const labelOf = (optionId: string) =>
       activity.options.find((option) => option.id === optionId)?.label ?? "?";
+    // Each option's badge number = its position in the order participants were
+    // shown (the deterministic scramble), so the number stays bound to the item
+    // and matches what they dragged — not a 1..n positional rank.
+    const presentation = seededShuffle(activity.options, activity.id);
+    const numberOf = (optionId: string) =>
+      presentation.findIndex((option) => option.id === optionId) + 1;
     const orderToText = (order: string[]) =>
-      order.map((optionId, index) => `${index + 1}. ${labelOf(optionId)}`).join("  ");
+      order.map((optionId) => `${numberOf(optionId)}. ${labelOf(optionId)}`).join("  ");
 
     const graded = answers.map((answer) => {
       const order = Array.isArray(answer.answer.order)
@@ -1719,7 +1731,9 @@ async function computeResponseSummary(
       type: activity.type,
       total: answers.length,
       correctAnswerText: correctOrder.length ? orderToText(correctOrder) : undefined,
-      correctOrderLabels: correctOrder.length ? correctOrder.map((optionId) => labelOf(optionId)) : undefined,
+      correctOrder: correctOrder.length
+        ? correctOrder.map((optionId) => ({ number: numberOf(optionId), label: labelOf(optionId) }))
+        : undefined,
       correctCount: correctOrder.length ? graded.filter((entry) => entry.isCorrect).length : undefined,
       responses: options.includeResponses
         ? graded.map((entry) => ({

@@ -129,7 +129,7 @@ export interface ResponseSummary {
   type: ActivityType;
   total: number;
   correctAnswerText?: string;
-  correctOrderLabels?: string[];
+  correctOrder?: Array<{ number: number; label: string }>;
   correctCount?: number;
   options?: Array<ActivityOption & { count: number; percent: number; isCorrect?: boolean }>;
   words?: Array<{

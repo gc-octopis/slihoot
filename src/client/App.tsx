@@ -1365,6 +1365,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   disabled={uploadingPresentation}
                   onClick={removePresentation}
                 >
+<<<<<<< HEAD
                   <img src={DELETE_ICON_URL} alt="" aria-hidden="true" />
                   刪除 PDF
                 </button>
@@ -1482,6 +1483,93 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                             type="checkbox"
                             checked={draft.hasTimeLimit}
                             onChange={(change) =>
+=======
+                  <option value="multiple_choice">選擇題</option>
+                  <option value="true_false">是非題</option>
+                  <option value="short_answer">簡答題</option>
+                  <option value="word_cloud">文字雲</option>
+                  <option value="ranking">排序題</option>
+                </select>
+              </label>
+              <label>
+                題目
+                <input
+                  value={draft.title}
+                  onChange={(change) => setDraft({ ...draft, title: change.target.value })}
+                />
+              </label>
+              <label>
+                補充說明
+                <textarea
+                  value={draft.description}
+                  onChange={(change) => setDraft({ ...draft, description: change.target.value })}
+                />
+              </label>
+              <label>
+                詳解
+                <textarea
+                  value={draft.explanation}
+                  onChange={(change) => setDraft({ ...draft, explanation: change.target.value })}
+                  placeholder="時間到後向參與者顯示的解析"
+                />
+              </label>
+              <label>
+                作答秒數（必填，需大於 0）
+                <input
+                  type="number"
+                  min={1}
+                  max={3600}
+                  placeholder="例如 30"
+                  value={draft.timeLimitSeconds === 0 ? "" : draft.timeLimitSeconds}
+                  onChange={(change) => {
+                    const raw = change.target.value;
+                    const parsed = Math.floor(Number(raw));
+                    setDraft({
+                      ...draft,
+                      timeLimitSeconds:
+                        raw === "" || !Number.isFinite(parsed) || parsed < 0
+                          ? 0
+                          : Math.min(3600, parsed)
+                    });
+                  }}
+                />
+              </label>
+              {draft.type === "multiple_choice" || draft.type === "true_false" ? (
+                <div className="form-stack">
+                  <span className="field-label">選項與正確答案</span>
+                  <div className="option-editor">
+                    {draft.options.map((option, index) => (
+                      <div className="option-edit-row" key={option.id}>
+                        <input
+                          type="radio"
+                          name="correct-answer"
+                          checked={draft.correctOptionId === option.id}
+                          onChange={() => setDraft({ ...draft, correctOptionId: option.id })}
+                          title="設為正確答案"
+                        />
+                        <input
+                          value={option.label}
+                          disabled={draft.type === "true_false"}
+                          onChange={(change) => {
+                            const nextOptions = draft.options.map((candidate) =>
+                              candidate.id === option.id
+                                ? { ...candidate, label: change.target.value }
+                                : candidate
+                            );
+                            setDraft({ ...draft, options: nextOptions });
+                          }}
+                          placeholder={`選項 ${index + 1}`}
+                        />
+                        {draft.type === "multiple_choice" ? (
+                          <button
+                            className="secondary"
+                            type="button"
+                            disabled={draft.options.length <= 2}
+                            onClick={() => {
+                              const nextOptions = draft.options.filter(
+                                (candidate) => candidate.id !== option.id
+                              );
+>>>>>>> 8e5641b71f60ff12af345b8ce83e157f645554b8
                               setDraft({
                                 ...draft,
                                 hasTimeLimit: change.target.checked,
@@ -1964,6 +2052,23 @@ function SortableList({
   const orderKeyRef = useRef<string>("");
   const slotMidpointsRef = useRef<number[]>([]);
 
+  // Stable badge number that stays with each option: assigned by the order an
+  // option is first seen, so dragging reorders the blocks but each keeps its
+  // original number (1,2,3,4,5 dragged into 1,3,2,4,5). Resets when the item set
+  // changes entirely (e.g. switching to a different question).
+  const numberByIdRef = useRef<Map<string, number>>(new Map());
+  const maxNumberRef = useRef(0);
+  if (numberByIdRef.current.size > 0 && !items.some((option) => numberByIdRef.current.has(option.id))) {
+    numberByIdRef.current = new Map();
+    maxNumberRef.current = 0;
+  }
+  for (const option of items) {
+    if (!numberByIdRef.current.has(option.id)) {
+      maxNumberRef.current += 1;
+      numberByIdRef.current.set(option.id, maxNumberRef.current);
+    }
+  }
+
   // FLIP: when the *order* actually changes (a reorder), slide each non-dragged
   // block from its old position to its new one. Gated on the id sequence so it
   // never fires on unrelated re-renders (e.g. typing a label in the editor),
@@ -2073,7 +2178,7 @@ function SortableList({
           <span className="drag-handle" aria-hidden>
             ⠿
           </span>
-          <span className="rank">{index + 1}</span>
+          <span className="rank">{numberByIdRef.current.get(option.id) ?? index + 1}</span>
           {renderItem(option, index)}
         </li>
       ))}
@@ -2087,7 +2192,7 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
   if (summary.type === "ranking") {
     return (
       <div className="answer-list">
-        {summary.correctOrderLabels?.length ? (
+        {summary.correctOrder?.length ? (
           <>
             <p className="muted">
               正確順序
@@ -2096,10 +2201,10 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
                 : null}
             </p>
             <ol className="result-order">
-              {summary.correctOrderLabels.map((label, index) => (
-                <li className="result-order-item" key={`${label}-${index}`}>
-                  <span className="rank">{index + 1}</span>
-                  <span className="name">{label}</span>
+              {summary.correctOrder.map((entry, index) => (
+                <li className="result-order-item" key={`${entry.number}-${index}`}>
+                  <span className="rank">{entry.number}</span>
+                  <span className="name">{entry.label}</span>
                 </li>
               ))}
             </ol>
