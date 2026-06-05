@@ -1,4 +1,9 @@
-export type ActivityType = "multiple_choice" | "true_false" | "short_answer" | "word_cloud";
+export type ActivityType =
+  | "multiple_choice"
+  | "true_false"
+  | "short_answer"
+  | "word_cloud"
+  | "ranking";
 export type LiveStatus = "waiting" | "active" | "ended";
 export type MessageStatus = "visible" | "hidden" | "deleted";
 
@@ -91,6 +96,7 @@ export interface ResponseSummary {
   type: ActivityType;
   total: number;
   correctAnswerText?: string;
+  correctOrderLabels?: string[];
   correctCount?: number;
   options?: Array<ActivityOption & { count: number; percent: number; isCorrect?: boolean }>;
   words?: Array<{
@@ -109,6 +115,14 @@ export interface ResponseSummary {
   }>;
 }
 
+export interface LeaderboardEntry {
+  participantId: string;
+  nickname: string;
+  score: number;
+  answers: number;
+  rank: number;
+}
+
 export interface LiveState {
   liveSession: LiveSessionRecord;
   event: EventRecord;
@@ -120,6 +134,9 @@ export interface LiveState {
   answerRevealed: boolean;
   answerClosed: boolean;
   activityOpen: boolean;
+  leaderboard?: LeaderboardEntry[];
+  myScore?: number;
+  myRank?: number | null;
   me?: ParticipantRecord | null;
   myResponse?: ResponseRecord | null;
 }

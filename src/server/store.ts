@@ -3,6 +3,7 @@ import type {
   ActivityRecord,
   ActivityType,
   EventRecord,
+  LeaderboardEntry,
   LiveMessageRecord,
   LiveSessionRecord,
   LiveState,
@@ -14,7 +15,13 @@ import type {
 import { pool } from "./db";
 import { cacheDel, cacheGet, cacheSet, presenceCount } from "./redis";
 
-const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_answer", "word_cloud"];
+const activityTypes: ActivityType[] = [
+  "multiple_choice",
+  "true_false",
+  "short_answer",
+  "word_cloud",
+  "ranking"
+];
 
 // --- Redis cache layer -----------------------------------------------------
 // Only shared, viewer-agnostic, expensive reads are cached. Live-session state
@@ -24,6 +31,21 @@ const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_a
 const ACTIVITIES_TTL = 10;
 const EVENT_TTL = 10;
 const SUMMARY_TTL = 3;
+const LEADERBOARD_TTL = 3;
+
+// Classic Kahoot-style scoring: a wrong answer scores 0; a correct answer
+// scores up to MAX_SCORE, scaled down by how long the participant took relative
+// to the question's time limit. Answering instantly ~= MAX_SCORE; using the
+// full time still earns half. Questions with no time limit award the full
+// MAX_SCORE for any correct answer.
+const MAX_SCORE = 1000;
+
+function computeScore(isCorrect: boolean, elapsedMs: number, limitSeconds: number) {
+  if (!isCorrect) return 0;
+  if (limitSeconds <= 0) return MAX_SCORE;
+  const fraction = Math.min(1, Math.max(0, elapsedMs / (limitSeconds * 1000)));
+  return Math.round(MAX_SCORE * (1 - fraction / 2));
+}
 
 // Presence freshness window. A connected participant is refreshed well within
 // this window by the server-side heartbeat (see index.ts), so a member only
@@ -54,6 +76,10 @@ function summaryKeysFor(liveId: string, activityId: string) {
     summaryKey(liveId, activityId, false, true),
     summaryKey(liveId, activityId, false, false)
   ];
+}
+
+function leaderboardKey(liveId: string) {
+  return `cache:leaderboard:${liveId}`;
 }
 
 function id() {
@@ -158,6 +184,12 @@ function normalizeCorrectAnswer(
     return text ? { text } : null;
   }
 
+  // For ranking the correct answer *is* the order the admin entered the items
+  // in, so it is derived from the options rather than a separate input.
+  if (type === "ranking") {
+    return options.length >= 2 ? { order: options.map((option) => option.id) } : null;
+  }
+
   const optionId = normalizeText(answerObject.optionId ?? correctAnswer, 80);
   return options.some((option) => option.id === optionId) ? { optionId } : null;
 }
@@ -251,12 +283,38 @@ function rowToMessage(row: any): LiveMessageRecord {
   };
 }
 
-export function publicActivity(activity: ActivityRecord): ActivityRecord {
-  return {
-    ...activity,
-    explanation: "",
-    correctAnswer: null
+// Deterministic Fisher-Yates shuffle (xfnv1a hash -> mulberry32 PRNG). Stable
+// for a given seed, so a ranking question's items appear in the same scrambled
+// order across every broadcast instead of jumping around on each state update.
+function seededShuffle<T>(items: T[], seed: string): T[] {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  let a = h >>> 0;
+  const rand = () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
+
+export function publicActivity(activity: ActivityRecord): ActivityRecord {
+  const base = { ...activity, explanation: "", correctAnswer: null };
+  // For ranking, the stored options order *is* the answer, so scramble the
+  // items participants see (stable per question) before reveal.
+  if (activity.type === "ranking") {
+    return { ...base, options: seededShuffle(activity.options, activity.id) };
+  }
+  return base;
 }
 
 function clampTimeLimit(value: unknown) {
@@ -448,8 +506,8 @@ export async function createActivity(
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
-  if (type === "multiple_choice" && options.length < 2) {
-    throw new Error("Multiple choice activities need at least two options.");
+  if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
+    throw new Error("Multiple choice and ranking activities need at least two options.");
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
@@ -529,8 +587,8 @@ export async function updateActivity(
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
-  if (type === "multiple_choice" && options.length < 2) {
-    throw new Error("Multiple choice activities need at least two options.");
+  if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
+    throw new Error("Multiple choice and ranking activities need at least two options.");
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
@@ -869,10 +927,61 @@ function validateAnswer(activity: ActivityRecord, answer: unknown) {
     return { text };
   }
 
+  if (activity.type === "ranking") {
+    const rawOrder = Array.isArray(answerObject.order) ? answerObject.order : [];
+    const order: string[] = rawOrder
+      .map((value: unknown) => normalizeText(value, 80))
+      .filter(Boolean);
+    const optionIds = activity.options.map((option) => option.id);
+    const isPermutation =
+      order.length === optionIds.length &&
+      new Set(order).size === order.length &&
+      order.every((optionId: string) => optionIds.includes(optionId));
+    if (!isPermutation) throw new Error("Invalid ranking order.");
+    return { order };
+  }
+
   const optionId = normalizeText(answerObject.optionId, 80);
   const option = activity.options.find((candidate) => candidate.id === optionId);
   if (!option) throw new Error("Invalid answer option.");
   return { optionId };
+}
+
+// Grade a validated answer against the activity's configured correct answer,
+// mirroring the correctness logic used when computing response summaries. Word
+// clouds and questions without a configured correct answer are never "correct"
+// (they simply score 0). `answer` is the normalised output of validateAnswer.
+function isAnswerCorrect(
+  activity: ActivityRecord,
+  answer: { optionId?: string; text?: string; order?: string[] }
+) {
+  const correct =
+    typeof activity.correctAnswer === "object" && activity.correctAnswer !== null
+      ? (activity.correctAnswer as any)
+      : null;
+  if (!correct) return false;
+
+  if (activity.type === "short_answer") {
+    const correctText = normalizeText(correct.text, 500);
+    return Boolean(correctText) && normalizeText(answer.text, 500) === correctText;
+  }
+
+  if (activity.type === "word_cloud") return false;
+
+  if (activity.type === "ranking") {
+    const correctOrder: string[] = Array.isArray(correct.order)
+      ? correct.order.map((value: unknown) => String(value))
+      : [];
+    const order = Array.isArray(answer.order) ? answer.order.map((value) => String(value)) : [];
+    return (
+      correctOrder.length > 0 &&
+      order.length === correctOrder.length &&
+      order.every((optionId, index) => optionId === correctOrder[index])
+    );
+  }
+
+  const correctOptionId = normalizeText(correct.optionId, 80);
+  return Boolean(correctOptionId) && normalizeText(answer.optionId, 80) === correctOptionId;
 }
 
 function extractWordCloudTexts(answer: unknown): string[] {
@@ -918,25 +1027,31 @@ export async function submitAnswer(input: {
         }
       : answer;
 
+  // Kahoot-style score, locked in at answer time from correctness + speed.
+  const elapsedMs = receivedAt.getTime() - new Date(liveSession.currentActivityStartedAt).getTime();
+  const score = computeScore(isAnswerCorrect(activity, answer), elapsedMs, activity.timeLimitSeconds);
+
   await pool.execute(
     `INSERT INTO responses
-      (id, live_session_id, activity_id, participant_id, answer_json, received_at)
+      (id, live_session_id, activity_id, participant_id, answer_json, received_at, score)
      VALUES
-      (:id, :liveId, :activityId, :participantId, :answerJson, :receivedAt)
+      (:id, :liveId, :activityId, :participantId, :answerJson, :receivedAt, :score)
      ON DUPLICATE KEY UPDATE
       answer_json = VALUES(answer_json),
-      received_at = VALUES(received_at)`,
+      received_at = VALUES(received_at),
+      score = VALUES(score)`,
     {
       id: responseId,
       liveId: input.liveId,
       activityId: input.activityId,
       participantId: input.participantId,
       answerJson: stringifyJson(answerForStorage),
-      receivedAt
+      receivedAt,
+      score
     }
   );
 
-  await cacheDel(...summaryKeysFor(input.liveId, input.activityId));
+  await cacheDel(...summaryKeysFor(input.liveId, input.activityId), leaderboardKey(input.liveId));
 
   return getResponse(input.liveId, input.activityId, input.participantId);
 }
@@ -1082,6 +1197,44 @@ async function computeResponseSummary(
     } satisfies ResponseSummary;
   }
 
+  if (activity.type === "ranking") {
+    const correctOrder: string[] =
+      typeof activity.correctAnswer === "object" && activity.correctAnswer !== null
+        ? ((activity.correctAnswer as any).order ?? []).map((value: unknown) => String(value))
+        : [];
+    const labelOf = (optionId: string) =>
+      activity.options.find((option) => option.id === optionId)?.label ?? "?";
+    const orderToText = (order: string[]) =>
+      order.map((optionId, index) => `${index + 1}. ${labelOf(optionId)}`).join("  ");
+
+    const graded = answers.map((answer) => {
+      const order = Array.isArray(answer.answer.order)
+        ? answer.answer.order.map((value: unknown) => String(value))
+        : [];
+      const isCorrect =
+        correctOrder.length > 0 &&
+        order.length === correctOrder.length &&
+        order.every((optionId: string, index: number) => optionId === correctOrder[index]);
+      return { participantName: answer.participantName, order, isCorrect, receivedAt: answer.receivedAt };
+    });
+
+    return {
+      type: activity.type,
+      total: answers.length,
+      correctAnswerText: correctOrder.length ? orderToText(correctOrder) : undefined,
+      correctOrderLabels: correctOrder.length ? correctOrder.map((optionId) => labelOf(optionId)) : undefined,
+      correctCount: correctOrder.length ? graded.filter((entry) => entry.isCorrect).length : undefined,
+      responses: options.includeResponses
+        ? graded.map((entry) => ({
+            participantName: options.includeParticipantNames ? entry.participantName : null,
+            text: orderToText(entry.order),
+            isCorrect: correctOrder.length ? entry.isCorrect : null,
+            receivedAt: entry.receivedAt
+          }))
+        : undefined
+    } satisfies ResponseSummary;
+  }
+
   const counts = new Map<string, number>();
   for (const option of activity.options) {
     counts.set(option.id, 0);
@@ -1119,6 +1272,47 @@ async function computeResponseSummary(
         })
       : undefined
   } satisfies ResponseSummary;
+}
+
+// Cumulative scores for every participant in the session, highest first.
+// Short-TTL cached and invalidated on each answer, mirroring the summary cache
+// so an 80-client broadcast collapses to ~1 DB query.
+export async function getLeaderboard(liveId: string): Promise<LeaderboardEntry[]> {
+  const key = leaderboardKey(liveId);
+  const cached = await cacheGet(key);
+  if (cached) {
+    try {
+      return JSON.parse(cached) as LeaderboardEntry[];
+    } catch {
+      /* fall through to recompute */
+    }
+  }
+
+  const [rows] = await pool.execute(
+    `SELECT
+      p.id AS participantId,
+      p.nickname AS nickname,
+      COALESCE(SUM(r.score), 0) AS score,
+      COUNT(r.id) AS answers
+    FROM participants p
+    LEFT JOIN responses r
+      ON r.participant_id = p.id AND r.live_session_id = :liveId
+    WHERE p.live_session_id = :liveId
+    GROUP BY p.id, p.nickname
+    ORDER BY score DESC, answers DESC, p.joined_at ASC`,
+    { liveId }
+  );
+
+  const entries: LeaderboardEntry[] = (rows as any[]).map((row, index) => ({
+    participantId: String(row.participantId),
+    nickname: String(row.nickname),
+    score: Number(row.score) || 0,
+    answers: Number(row.answers) || 0,
+    rank: index + 1
+  }));
+
+  await cacheSet(key, JSON.stringify(entries), LEADERBOARD_TTL);
+  return entries;
 }
 
 export async function getLiveState(
@@ -1174,6 +1368,11 @@ export async function getLiveState(
         ? currentActivity
         : publicActivity(currentActivity);
 
+  const fullLeaderboard = await getLeaderboard(liveId);
+  const myEntry = participantId
+    ? fullLeaderboard.find((entry) => entry.participantId === participantId)
+    : undefined;
+
   return {
     liveSession,
     event: {
@@ -1191,6 +1390,9 @@ export async function getLiveState(
     answerRevealed,
     answerClosed,
     activityOpen,
+    leaderboard: fullLeaderboard.slice(0, 10),
+    myScore: participantId ? (myEntry?.score ?? 0) : undefined,
+    myRank: participantId ? (myEntry?.rank ?? null) : undefined,
     me: participantId ? await getParticipant(participantId) : undefined,
     myResponse
   };
@@ -1317,4 +1519,137 @@ export async function moderateMessage(input: {
   }
 
   return getMessage(input.messageId);
+}
+
+// Render a stored answer as a human-readable string for data export.
+function answerToText(activity: ActivityRecord, answer: any): string {
+  if (activity.type === "short_answer") return normalizeText(answer?.text, 500);
+  if (activity.type === "word_cloud") {
+    const texts = Array.isArray(answer?.texts) ? answer.texts : [answer?.text];
+    return texts.map((value: unknown) => normalizeText(value, 80)).filter(Boolean).join(", ");
+  }
+  if (activity.type === "ranking") {
+    const order = Array.isArray(answer?.order) ? answer.order : [];
+    return order
+      .map((optionId: unknown) =>
+        activity.options.find((option) => option.id === String(optionId))?.label ?? "?"
+      )
+      .join(" → ");
+  }
+  const optionId = normalizeText(answer?.optionId, 80);
+  return activity.options.find((option) => option.id === optionId)?.label ?? optionId;
+}
+
+export interface EventExport {
+  exportedAt: string;
+  event: { id: string; title: string; description: string };
+  activities: Array<{
+    id: string;
+    sortOrder: number;
+    type: ActivityType;
+    title: string;
+    timeLimitSeconds: number;
+    options: ActivityOption[];
+    correctAnswer: unknown;
+  }>;
+  liveSessions: Array<{
+    id: string;
+    joinCode: string;
+    status: string;
+    startedAt: string | null;
+    endedAt: string | null;
+  }>;
+  responses: Array<{
+    liveSessionId: string;
+    joinCode: string;
+    activityId: string;
+    activityTitle: string;
+    activityType: string;
+    questionNumber: number | null;
+    participantId: string;
+    nickname: string;
+    answer: string;
+    correct: boolean;
+    score: number;
+    receivedAt: string;
+  }>;
+}
+
+// Gather everything recorded for an event (its questions and every answer
+// across all of its live sessions) for download. Returns null if not found.
+export async function exportEventData(eventId: string): Promise<EventExport | null> {
+  const event = await getEvent(eventId);
+  if (!event) return null;
+
+  const activities = await listActivities(eventId);
+  const activityById = new Map(activities.map((activity) => [activity.id, activity]));
+
+  const [sessionRows] = await pool.execute(
+    `SELECT id, join_code AS joinCode, status,
+            started_at AS startedAt, ended_at AS endedAt
+     FROM live_sessions
+     WHERE event_id = :eventId
+     ORDER BY created_at ASC`,
+    { eventId }
+  );
+
+  const [responseRows] = await pool.execute(
+    `SELECT
+      r.live_session_id AS liveSessionId,
+      ls.join_code AS joinCode,
+      r.activity_id AS activityId,
+      r.participant_id AS participantId,
+      p.nickname AS nickname,
+      r.answer_json AS answerJson,
+      r.score AS score,
+      r.received_at AS receivedAt
+    FROM responses r
+    INNER JOIN live_sessions ls ON ls.id = r.live_session_id
+    INNER JOIN participants p ON p.id = r.participant_id
+    WHERE ls.event_id = :eventId
+    ORDER BY ls.created_at ASC, r.received_at ASC`,
+    { eventId }
+  );
+
+  const responses = (responseRows as any[]).map((row) => {
+    const activity = activityById.get(row.activityId);
+    const answer = parseJson<any>(row.answerJson, {});
+    const score = Number(row.score) || 0;
+    return {
+      liveSessionId: String(row.liveSessionId),
+      joinCode: String(row.joinCode),
+      activityId: String(row.activityId),
+      activityTitle: activity?.title ?? "",
+      activityType: activity?.type ?? "",
+      questionNumber: activity ? activity.sortOrder + 1 : null,
+      participantId: String(row.participantId),
+      nickname: String(row.nickname),
+      answer: activity ? answerToText(activity, answer) : JSON.stringify(answer),
+      correct: score > 0,
+      score,
+      receivedAt: toIso(row.receivedAt)
+    };
+  });
+
+  return {
+    exportedAt: new Date().toISOString(),
+    event: { id: event.id, title: event.title, description: event.description },
+    activities: activities.map((activity) => ({
+      id: activity.id,
+      sortOrder: activity.sortOrder,
+      type: activity.type,
+      title: activity.title,
+      timeLimitSeconds: activity.timeLimitSeconds,
+      options: activity.options,
+      correctAnswer: activity.correctAnswer
+    })),
+    liveSessions: (sessionRows as any[]).map((row) => ({
+      id: String(row.id),
+      joinCode: String(row.joinCode),
+      status: String(row.status),
+      startedAt: row.startedAt ? toIso(row.startedAt) : null,
+      endedAt: row.endedAt ? toIso(row.endedAt) : null
+    })),
+    responses
+  };
 }

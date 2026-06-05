@@ -6,6 +6,7 @@ import type {
   ActivityRecord,
   ActivityType,
   EventRecord,
+  LeaderboardEntry,
   LiveMessageRecord,
   LiveSessionRecord,
   LiveState,
@@ -644,9 +645,12 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           ? draft.correctText.trim()
             ? { text: draft.correctText.trim() }
             : null
-          : draft.correctOptionId
-            ? { optionId: draft.correctOptionId }
-            : null
+          : // Ranking's correct answer is derived server-side from the item order.
+            draft.type === "ranking"
+            ? null
+            : draft.correctOptionId
+              ? { optionId: draft.correctOptionId }
+              : null
     };
   }
 
@@ -794,6 +798,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   <option value="true_false">是非題</option>
                   <option value="short_answer">簡答題</option>
                   <option value="word_cloud">文字雲</option>
+                  <option value="ranking">排序題</option>
                 </select>
               </label>
               <label>
@@ -909,6 +914,68 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   />
                 </label>
               ) : null}
+              {draft.type === "ranking" ? (
+                <div className="form-stack">
+                  <span className="field-label">排序項目（拖曳調整，由上到下＝正確順序）</span>
+                  <SortableList
+                    items={draft.options}
+                    onReorder={(orderedIds) =>
+                      setDraft({
+                        ...draft,
+                        options: orderedIds.map(
+                          (optionId) => draft.options.find((option) => option.id === optionId)!
+                        )
+                      })
+                    }
+                    renderItem={(option) => (
+                      <>
+                        <input
+                          value={option.label}
+                          onPointerDown={(pointer) => pointer.stopPropagation()}
+                          onChange={(change) =>
+                            setDraft({
+                              ...draft,
+                              options: draft.options.map((candidate) =>
+                                candidate.id === option.id
+                                  ? { ...candidate, label: change.target.value }
+                                  : candidate
+                              )
+                            })
+                          }
+                          placeholder="項目內容"
+                        />
+                        <button
+                          className="secondary"
+                          type="button"
+                          onPointerDown={(pointer) => pointer.stopPropagation()}
+                          disabled={draft.options.length <= 2}
+                          onClick={() =>
+                            setDraft({
+                              ...draft,
+                              options: draft.options.filter((candidate) => candidate.id !== option.id)
+                            })
+                          }
+                        >
+                          移除
+                        </button>
+                      </>
+                    )}
+                  />
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={draft.options.length >= 6}
+                    onClick={() =>
+                      setDraft({
+                        ...draft,
+                        options: [...draft.options, draftOption(`項目 ${draft.options.length + 1}`)]
+                      })
+                    }
+                  >
+                    新增項目
+                  </button>
+                </div>
+              ) : null}
               <div className="button-row">
                 <button>{editingId ? "更新題目" : "新增題目"}</button>
                 {editingId ? (
@@ -944,8 +1011,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                 ) : null}
                 {activity.options.length ? (
                   <div className="option-pills">
-                    {activity.options.map((option) => (
+                    {activity.options.map((option, index) => (
                       <span key={option.id}>
+                        {activity.type === "ranking" ? `${index + 1}. ` : ""}
                         {option.label}
                         {correctOptionId(activity.correctAnswer) === option.id ? " (正解)" : ""}
                       </span>
@@ -979,8 +1047,220 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   );
 }
 
+function Leaderboard({
+  entries,
+  meId,
+  title = "排行榜"
+}: {
+  entries?: LeaderboardEntry[];
+  meId?: string | null;
+  title?: string;
+}) {
+  if (!entries?.length) return null;
+  return (
+    <section className="results-panel leaderboard-panel">
+      <h2>{title}</h2>
+      <ol className="leaderboard">
+        {entries.map((entry) => (
+          <li
+            key={entry.participantId}
+            className={meId && entry.participantId === meId ? "leaderboard-row me" : "leaderboard-row"}
+          >
+            <span className="rank">{entry.rank}</span>
+            <span className="name">{entry.nickname}</span>
+            <strong className="score">{entry.score}</strong>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+// Drag-to-reorder list built on Pointer Events so it works with both mouse and
+// touch (phones). Controlled: emits the new id order via onReorder. Children of
+// each row come from renderItem; interactive children (inputs/buttons) should
+// stopPropagation on pointerdown so they don't start a drag.
+function SortableList({
+  items,
+  disabled,
+  onReorder,
+  renderItem
+}: {
+  items: ActivityOption[];
+  disabled?: boolean;
+  onReorder: (orderedIds: string[]) => void;
+  renderItem: (option: ActivityOption, index: number) => React.ReactNode;
+}) {
+  const containerRef = useRef<HTMLUListElement | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const draggingRef = useRef<string | null>(null);
+  const prevRectsRef = useRef<Map<string, DOMRect>>(new Map());
+  const orderKeyRef = useRef<string>("");
+  const slotMidpointsRef = useRef<number[]>([]);
+
+  // FLIP: when the *order* actually changes (a reorder), slide each non-dragged
+  // block from its old position to its new one. Gated on the id sequence so it
+  // never fires on unrelated re-renders (e.g. typing a label in the editor),
+  // which previously caused jumpiness.
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const blocks = Array.from(container.querySelectorAll<HTMLElement>("[data-sortable-id]"));
+    const orderKey = items.map((option) => option.id).join(",");
+    const orderChanged = orderKey !== orderKeyRef.current;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const animate = orderChanged && Boolean(orderKeyRef.current) && !reduceMotion;
+
+    // Only on a real reorder: cancel any in-flight slide so getBoundingClientRect
+    // reads the true resting layout. Left untouched on unrelated re-renders
+    // (typing, hover) so CSS transitions aren't disturbed.
+    if (animate) {
+      for (const block of blocks) for (const a of block.getAnimations()) a.cancel();
+    }
+
+    const nextRects = new Map<string, DOMRect>();
+    for (const block of blocks) nextRects.set(block.dataset.sortableId!, block.getBoundingClientRect());
+
+    if (animate) {
+      for (const block of blocks) {
+        const id = block.dataset.sortableId!;
+        if (id === draggingRef.current) continue;
+        const prev = prevRectsRef.current.get(id);
+        const next = nextRects.get(id);
+        if (!prev || !next) continue;
+        const deltaY = prev.top - next.top;
+        if (Math.abs(deltaY) < 0.5) continue;
+        block.animate([{ transform: `translateY(${deltaY}px)` }, { transform: "translateY(0)" }], {
+          duration: 130,
+          easing: "ease-out"
+        });
+      }
+    }
+
+    prevRectsRef.current = nextRects;
+    orderKeyRef.current = orderKey;
+  });
+
+  function moveDraggedTo(targetIndex: number) {
+    if (draggingId === null) return;
+    const currentIndex = items.findIndex((option) => option.id === draggingId);
+    if (currentIndex === -1 || currentIndex === targetIndex) return;
+    const next = [...items];
+    const [moved] = next.splice(currentIndex, 1);
+    next.splice(targetIndex, 0, moved!);
+    onReorder(next.map((option) => option.id));
+  }
+
+  function handlePointerMove(event: React.PointerEvent) {
+    if (draggingId === null) return;
+    // Target the slot whose fixed midpoint the pointer has passed. Using the
+    // slot geometry captured at drag start (not live, animating rects) keeps the
+    // reorder stable and symmetric — reading live positions made downward drags
+    // pick up mid-animation rects and ghost.
+    const midpoints = slotMidpointsRef.current;
+    if (!midpoints.length) return;
+    let targetIndex = 0;
+    for (const midpoint of midpoints) {
+      if (event.clientY > midpoint) targetIndex += 1;
+    }
+    moveDraggedTo(Math.min(targetIndex, items.length - 1));
+  }
+
+  const endDrag = () => {
+    draggingRef.current = null;
+    setDraggingId(null);
+  };
+
+  return (
+    <ul
+      className="sortable-list"
+      ref={containerRef}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+    >
+      {items.map((option, index) => (
+        <li
+          key={option.id}
+          data-sortable-id={option.id}
+          className={`sortable-item${draggingId === option.id ? " dragging" : ""}${
+            disabled ? " disabled" : ""
+          }`}
+          style={disabled ? undefined : { touchAction: "none" }}
+          onPointerDown={(event) => {
+            if (disabled) return;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            // Snapshot each slot's midpoint (resting layout) for stable targeting.
+            const container = containerRef.current;
+            slotMidpointsRef.current = container
+              ? Array.from(container.querySelectorAll<HTMLElement>("[data-sortable-id]")).map(
+                  (block) => {
+                    const rect = block.getBoundingClientRect();
+                    return rect.top + rect.height / 2;
+                  }
+                )
+              : [];
+            draggingRef.current = option.id;
+            setDraggingId(option.id);
+          }}
+        >
+          <span className="drag-handle" aria-hidden>
+            ⠿
+          </span>
+          <span className="rank">{index + 1}</span>
+          {renderItem(option, index)}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function SummaryView({ summary }: { summary: ResponseSummary | null }) {
   if (!summary) return <p className="muted">尚未開放或沒有結果。</p>;
+
+  if (summary.type === "ranking") {
+    return (
+      <div className="answer-list">
+        {summary.correctOrderLabels?.length ? (
+          <>
+            <p className="muted">
+              正確順序
+              {typeof summary.correctCount === "number"
+                ? `（答對 ${summary.correctCount} / ${summary.total} 人）`
+                : null}
+            </p>
+            <ol className="result-order">
+              {summary.correctOrderLabels.map((label, index) => (
+                <li className="result-order-item" key={`${label}-${index}`}>
+                  <span className="rank">{index + 1}</span>
+                  <span className="name">{label}</span>
+                </li>
+              ))}
+            </ol>
+          </>
+        ) : (
+          <p className="muted">尚未設定正確順序。</p>
+        )}
+        {summary.responses?.length ? (
+          <div className="answer-list">
+            {summary.responses.map((response, index) => (
+              <div className="answer-item" key={`${response.receivedAt}-${index}`}>
+                <strong>{response.participantName ?? "匿名"}</strong>
+                <p>
+                  {response.text}
+                  {response.isCorrect === true ? (
+                    <em className="verdict correct"> 正確</em>
+                  ) : response.isCorrect === false ? (
+                    <em className="verdict wrong"> 錯誤</em>
+                  ) : null}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
 
   if (summary.type === "short_answer") {
     return (
@@ -1452,6 +1732,28 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     setState((current) => (current ? { ...current, liveSession } : current));
   }
 
+  async function downloadExport(format: "xlsx" | "json" | "csv") {
+    const eventId = state?.event.id;
+    if (!token || !eventId) return;
+    try {
+      const response = await fetch(`/api/events/${eventId}/export?format=${format}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) throw new Error(`匯出失敗（${response.status}）`);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `slihoot-event-${eventId}.${format}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "匯出失敗");
+    }
+  }
+
   return (
     <AdminGuard>
       <main className="page live-layout">
@@ -1531,25 +1833,35 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           </div>
           <div className="button-row">
             {hasCurrentActivity && !activityOpen ? (
-              <button onClick={() => socket.send("start_activity", {})}>開始答題</button>
+              <button
+                disabled={!socket.connected}
+                title={!socket.connected ? "連線中，請稍候" : undefined}
+                onClick={() => socket.send("start_activity", {})}
+              >
+                開始答題
+              </button>
             ) : null}
             <button
-              disabled={!previousActivity}
+              disabled={!previousActivity || !socket.connected}
               onClick={() => socket.send("change_activity", { activityId: previousActivity.id })}
             >
               上一題
             </button>
             <button
-              disabled={!nextActivity}
+              disabled={!nextActivity || !socket.connected}
               onClick={() => socket.send("change_activity", { activityId: nextActivity.id })}
             >
               下一題
             </button>
             <button
               hidden={isWordCloudActivity}
-              disabled={remaining !== null && remaining > 0}
+              disabled={!socket.connected || (remaining !== null && remaining > 0)}
               title={
-                remaining !== null && remaining > 0 ? "倒數結束後才能公布結果" : undefined
+                !socket.connected
+                  ? "連線中，請稍候"
+                  : remaining !== null && remaining > 0
+                    ? "倒數結束後才能公布結果"
+                    : undefined
               }
               onClick={() =>
                 socket.send("set_results_visibility", {
@@ -1561,6 +1873,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </button>
             <button
               hidden={isWordCloudActivity}
+              disabled={!socket.connected}
               onClick={() =>
                 socket.send("set_participant_name_visibility", {
                   showParticipantNames: !state?.liveSession.showParticipantNames
@@ -1573,9 +1886,28 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               結束
             </button>
           </div>
+          {!socket.connected ? (
+            <p className="muted">連線中，請稍候再操作…</p>
+          ) : null}
           <section className="results-panel">
             <h2>即時結果</h2>
             <SummaryView summary={state?.responseSummary ?? null} />
+          </section>
+          <Leaderboard entries={state?.leaderboard} />
+          <section className="results-panel">
+            <h2>匯出歷史數據</h2>
+            <div className="button-row">
+              <button type="button" onClick={() => downloadExport("xlsx")}>
+                匯出 Excel
+              </button>
+              <button type="button" className="secondary" onClick={() => downloadExport("json")}>
+                匯出 JSON
+              </button>
+              <button type="button" className="secondary" onClick={() => downloadExport("csv")}>
+                匯出 CSV
+              </button>
+            </div>
+            <p className="muted">包含這個活動所有場次的作答紀錄、答對與分數。</p>
           </section>
         </section>
         <ChatPanel
@@ -1596,6 +1928,7 @@ function AnswerForm({
   revealed,
   submittedOptionId = "",
   submittedText = "",
+  submittedOrder,
   onSubmit
 }: {
   activity: ActivityRecord;
@@ -1603,17 +1936,50 @@ function AnswerForm({
   revealed: boolean;
   submittedOptionId?: string;
   submittedText?: string;
+  submittedOrder?: string[];
   onSubmit: (answer: unknown) => boolean | void;
 }) {
   const [selected, setSelected] = useState("");
   const [text, setText] = useState("");
+  const [order, setOrder] = useState<string[]>([]);
   const correctId = correctOptionId(activity.correctAnswer);
 
   useEffect(() => {
     setSelected(submittedOptionId);
     setText(submittedText);
+    // Use the participant's submitted order if any, else the (server-scrambled)
+    // option order they were shown.
+    setOrder(
+      submittedOrder && submittedOrder.length
+        ? submittedOrder
+        : activity.options.map((option) => option.id)
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activity.id]);
+
+  if (activity.type === "ranking") {
+    const orderedItems = order
+      .map((optionId) => activity.options.find((option) => option.id === optionId))
+      .filter((option): option is ActivityOption => Boolean(option));
+    return (
+      <form
+        className="form-stack"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit({ order });
+        }}
+      >
+        {!disabled ? <p className="muted">拖曳方塊調整順序</p> : null}
+        <SortableList
+          items={orderedItems}
+          disabled={disabled}
+          onReorder={(orderedIds) => setOrder(orderedIds)}
+          renderItem={(option) => <span className="name">{option.label}</span>}
+        />
+        <button disabled={disabled}>{disabled ? "已送出" : "送出排序"}</button>
+      </form>
+    );
+  }
 
   if (activity.type === "word_cloud") {
     return (
@@ -1782,12 +2148,14 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const currentActivity = state?.currentActivity ?? null;
   const answerLocked = Boolean(localResponse) && currentActivity?.type !== "word_cloud";
   const myAnswer = (localResponse?.answer ?? state?.myResponse?.answer) as
-    | { optionId?: unknown; text?: unknown }
+    | { optionId?: unknown; text?: unknown; order?: unknown }
     | undefined;
   const submittedOptionId =
     myAnswer && typeof myAnswer === "object" ? String(myAnswer.optionId ?? "") : "";
   const submittedText =
     myAnswer && typeof myAnswer === "object" ? String(myAnswer.text ?? "") : "";
+  const submittedOrder =
+    myAnswer && Array.isArray(myAnswer.order) ? myAnswer.order.map((value) => String(value)) : undefined;
   const remaining = useServerCountdown(state);
   const revealed = Boolean(state?.answerRevealed);
   const closed = Boolean(state?.answerClosed);
@@ -1841,6 +2209,7 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
               revealed={revealed}
               submittedOptionId={submittedOptionId}
               submittedText={submittedText}
+              submittedOrder={submittedOrder}
               onSubmit={(answer) => {
                 const sent = socket.send("submit_answer", {
                   activityId: currentActivity.id,
@@ -1862,6 +2231,12 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
                 <SummaryView summary={state?.responseSummary ?? null} />
               </section>
             ) : null}
+            {revealed && state?.myRank ? (
+              <p className="my-score">
+                你的分數 <strong>{state.myScore ?? 0}</strong> 分 · 目前第 {state.myRank} 名
+              </p>
+            ) : null}
+            {revealed ? <Leaderboard entries={state?.leaderboard} meId={state?.me?.id} /> : null}
           </>
         ) : state?.liveSession.currentActivityId ? (
           <p className="muted">主持人即將開始這一題，請稍候…</p>

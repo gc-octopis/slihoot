@@ -3,6 +3,7 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { createBunWebSocket, serveStatic } from "hono/bun";
+import * as XLSX from "xlsx";
 import { readdir } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,7 @@ import {
   deleteActivity,
   deleteEvent,
   endLiveSession,
+  exportEventData,
   getActivity,
   getEvent,
   getLiveSession,
@@ -580,6 +582,77 @@ async function routeJson<T>(
   }
 }
 
+// Flatten an event export to CSV: one row per recorded answer. Prefixed with a
+// UTF-8 BOM so Excel opens Chinese text correctly.
+function exportToCsv(data: Awaited<ReturnType<typeof exportEventData>>): string {
+  if (!data) return "";
+  const header = [
+    "join_code",
+    "question_number",
+    "activity_title",
+    "activity_type",
+    "participant",
+    "answer",
+    "correct",
+    "score",
+    "received_at"
+  ];
+  const cell = (value: unknown) => {
+    const text = String(value ?? "");
+    return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  const lines = [header.join(",")];
+  for (const row of data.responses) {
+    lines.push(
+      [
+        row.joinCode,
+        row.questionNumber ?? "",
+        row.activityTitle,
+        row.activityType,
+        row.nickname,
+        row.answer,
+        row.correct,
+        row.score,
+        row.receivedAt
+      ]
+        .map(cell)
+        .join(",")
+    );
+  }
+  return "﻿" + lines.join("\r\n");
+}
+
+// Build an .xlsx workbook from an event export: a "作答紀錄" sheet (one row per
+// answer) plus a "題目" sheet listing the questions. Returns the file bytes.
+function exportToXlsx(data: NonNullable<Awaited<ReturnType<typeof exportEventData>>>): Uint8Array {
+  const responseRows = data.responses.map((row) => ({
+    場次代碼: row.joinCode,
+    題號: row.questionNumber ?? "",
+    題目: row.activityTitle,
+    題型: row.activityType,
+    參與者: row.nickname,
+    答案: row.answer,
+    答對: row.correct ? "是" : "否",
+    分數: row.score,
+    作答時間: row.receivedAt
+  }));
+  const activityRows = data.activities.map((activity) => ({
+    題號: activity.sortOrder + 1,
+    題目: activity.title,
+    題型: activity.type,
+    秒數: activity.timeLimitSeconds
+  }));
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.json_to_sheet(responseRows.length ? responseRows : [{ 場次代碼: "", 題號: "", 題目: "", 題型: "", 參與者: "", 答案: "", 答對: "", 分數: "", 作答時間: "" }]),
+    "作答紀錄"
+  );
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(activityRows), "題目");
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Uint8Array;
+}
+
 async function participantFromRequest(c: Context) {
   const token =
     c.req.header("x-participant-token") ?? tokenFromAuthorization(c.req.header("authorization"));
@@ -698,6 +771,40 @@ app.get("/api/events/:eventId", requireAdmin, async (c) =>
     return event;
   })
 );
+
+app.get("/api/events/:eventId/export", requireAdmin, async (c) => {
+  const eventId = c.req.param("eventId")!;
+  const data = await exportEventData(eventId);
+  if (!data) return c.json({ error: "Event not found." }, 404);
+
+  const format = c.req.query("format");
+  const ext = format === "csv" ? "csv" : format === "xlsx" ? "xlsx" : "json";
+  // HTTP header values must be ASCII, so keep a safe ASCII `filename` and offer
+  // the (possibly non-ASCII) event title via RFC 5987 `filename*`.
+  const asciiSlug = data.event.title.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const asciiName = `slihoot-${asciiSlug || eventId}.${ext}`;
+  const niceName = encodeURIComponent(`slihoot-${data.event.title || eventId}.${ext}`);
+  const disposition = `attachment; filename="${asciiName}"; filename*=UTF-8''${niceName}`;
+
+  if (ext === "xlsx") {
+    return new Response(exportToXlsx(data) as unknown as BodyInit, {
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": disposition
+      }
+    });
+  }
+
+  if (ext === "csv") {
+    return new Response(exportToCsv(data), {
+      headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": disposition }
+    });
+  }
+
+  return new Response(JSON.stringify(data, null, 2), {
+    headers: { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": disposition }
+  });
+});
 
 app.put("/api/events/:eventId", requireAdmin, async (c) =>
   routeJson(c, async () => {
