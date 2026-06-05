@@ -1,4 +1,7 @@
 import mysql from "mysql2/promise";
+import { readdir, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { env } from "./env";
 
 export const pool = mysql.createPool({
@@ -12,149 +15,114 @@ export const pool = mysql.createPool({
   namedPlaceholders: true
 });
 
-const migrations = [
-  `CREATE TABLE IF NOT EXISTS events (
-    id VARCHAR(36) PRIMARY KEY,
-    title VARCHAR(200) NOT NULL,
-    description TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-  )`,
-  `CREATE TABLE IF NOT EXISTS activities (
-    id VARCHAR(36) PRIMARY KEY,
-    event_id VARCHAR(36) NOT NULL,
-    type VARCHAR(32) NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    options_json JSON NULL,
-    correct_answer_json JSON NULL,
-    sort_order INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_activities_event_order (event_id, sort_order),
-    CONSTRAINT fk_activities_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS event_presentations (
-    id VARCHAR(36) PRIMARY KEY,
-    event_id VARCHAR(36) NOT NULL,
-    original_name VARCHAR(255) NOT NULL,
-    stored_name VARCHAR(255) NOT NULL,
-    mime_type VARCHAR(120) NOT NULL,
-    file_size BIGINT NOT NULL DEFAULT 0,
-    page_count INT NOT NULL DEFAULT 0,
-    page_sizes_json JSON NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uniq_event_presentation (event_id),
-    CONSTRAINT fk_presentations_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS event_timeline_items (
-    id VARCHAR(36) PRIMARY KEY,
-    event_id VARCHAR(36) NOT NULL,
-    type VARCHAR(24) NOT NULL,
-    activity_id VARCHAR(36) NULL,
-    presentation_id VARCHAR(36) NULL,
-    page_number INT NULL,
-    sort_order INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_timeline_event_order (event_id, sort_order),
-    INDEX idx_timeline_activity (activity_id),
-    CONSTRAINT fk_timeline_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
-    CONSTRAINT fk_timeline_activity FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
-    CONSTRAINT fk_timeline_presentation FOREIGN KEY (presentation_id) REFERENCES event_presentations(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS live_sessions (
-    id VARCHAR(36) PRIMARY KEY,
-    event_id VARCHAR(36) NOT NULL,
-    join_code VARCHAR(8) NOT NULL UNIQUE,
-    status VARCHAR(16) NOT NULL DEFAULT 'active',
-    current_timeline_item_id VARCHAR(36) NULL,
-    current_timeline_index INT NOT NULL DEFAULT 0,
-    current_activity_id VARCHAR(36) NULL,
-    current_activity_index INT NOT NULL DEFAULT 0,
-    show_results BOOLEAN NOT NULL DEFAULT FALSE,
-    show_participant_names BOOLEAN NOT NULL DEFAULT FALSE,
-    started_at DATETIME NULL,
-    ended_at DATETIME NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_live_sessions_event (event_id),
-    INDEX idx_live_sessions_join_code (join_code),
-    CONSTRAINT fk_live_sessions_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS participants (
-    id VARCHAR(36) PRIMARY KEY,
-    live_session_id VARCHAR(36) NOT NULL,
-    nickname VARCHAR(80) NOT NULL,
-    token_hash CHAR(64) NOT NULL UNIQUE,
-    joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_participants_live (live_session_id),
-    CONSTRAINT fk_participants_live FOREIGN KEY (live_session_id) REFERENCES live_sessions(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS responses (
-    id VARCHAR(36) PRIMARY KEY,
-    live_session_id VARCHAR(36) NOT NULL,
-    activity_id VARCHAR(36) NOT NULL,
-    participant_id VARCHAR(36) NOT NULL,
-    answer_json JSON NOT NULL,
-    received_at DATETIME(3) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uniq_response_once (live_session_id, activity_id, participant_id),
-    INDEX idx_responses_activity (live_session_id, activity_id),
-    CONSTRAINT fk_responses_live FOREIGN KEY (live_session_id) REFERENCES live_sessions(id) ON DELETE CASCADE,
-    CONSTRAINT fk_responses_activity FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
-    CONSTRAINT fk_responses_participant FOREIGN KEY (participant_id) REFERENCES participants(id) ON DELETE CASCADE
-  )`,
-  `CREATE TABLE IF NOT EXISTS live_messages (
-    id VARCHAR(36) PRIMARY KEY,
-    live_session_id VARCHAR(36) NOT NULL,
-    participant_id VARCHAR(36) NOT NULL,
-    content VARCHAR(200) NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'visible',
-    pinned BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    moderated_at DATETIME NULL,
-    INDEX idx_messages_live_created (live_session_id, created_at),
-    CONSTRAINT fk_messages_live FOREIGN KEY (live_session_id) REFERENCES live_sessions(id) ON DELETE CASCADE,
-    CONSTRAINT fk_messages_participant FOREIGN KEY (participant_id) REFERENCES participants(id) ON DELETE CASCADE
-  )`
-];
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
+
+/** Strip line comments and split a .sql file into individual statements. */
+function splitStatements(sql: string): string[] {
+  const withoutComments = sql
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("--"))
+    .join("\n");
+
+  return withoutComments
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+}
+
+/**
+ * Versioned, file-based migration runner. Each `migrations/NNNN_*.sql` file is
+ * applied at most once; applied versions are recorded in `schema_migrations`.
+ * Replaces the previous hand-rolled migration array + addColumnIfMissing.
+ */
+export async function migrate() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version VARCHAR(255) PRIMARY KEY,
+    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  const [appliedRows] = await pool.query(`SELECT version FROM schema_migrations`);
+  const applied = new Set((appliedRows as any[]).map((row) => row.version as string));
+
+  const files = (await readdir(migrationsDir))
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+
+  for (const file of files) {
+    if (applied.has(file)) continue;
+
+    const sql = await readFile(join(migrationsDir, file), "utf8");
+    for (const statement of splitStatements(sql)) {
+      await pool.query(statement);
+    }
+    await pool.query(`INSERT INTO schema_migrations (version) VALUES (?)`, [file]);
+    console.log(`[slihoot] applied migration ${file}`);
+  }
+
+  await ensureLegacySchemaCompatibility();
+}
+
+async function tableExists(tableName: string) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) AS total
+     FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+    [tableName]
+  );
+  return Number((rows as any[])[0]?.total ?? 0) > 0;
+}
+
+async function columnExists(tableName: string, columnName: string) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) AS total
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [tableName, columnName]
+  );
+  return Number((rows as any[])[0]?.total ?? 0) > 0;
+}
 
 async function addColumnIfMissing(tableName: string, columnName: string, definition: string) {
-  const [rows] = await pool.execute(
-    `SELECT COLUMN_NAME
-     FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE()
-       AND TABLE_NAME = :tableName
-       AND COLUMN_NAME = :columnName
-     LIMIT 1`,
-    { tableName, columnName }
-  );
-
-  if ((rows as any[]).length > 0) return;
-
+  if (!(await tableExists(tableName))) return;
+  if (await columnExists(tableName, columnName)) return;
   await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${definition}`);
 }
 
-export async function migrate() {
-  for (const statement of migrations) {
-    await pool.query(statement);
-  }
-
-  await addColumnIfMissing(
-    "live_sessions",
-    "show_participant_names",
-    "show_participant_names BOOLEAN NOT NULL DEFAULT FALSE AFTER show_results"
+async function ensureLegacySchemaCompatibility() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS event_presentations (
+      id VARCHAR(36) PRIMARY KEY,
+      event_id VARCHAR(36) NOT NULL,
+      original_name VARCHAR(255) NOT NULL,
+      stored_name VARCHAR(255) NOT NULL,
+      mime_type VARCHAR(120) NOT NULL,
+      file_size BIGINT NOT NULL DEFAULT 0,
+      page_count INT NOT NULL DEFAULT 0,
+      page_sizes_json JSON NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_event_presentation (event_id),
+      CONSTRAINT fk_presentations_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+    )`
   );
 
-  await addColumnIfMissing(
-    "live_sessions",
-    "current_activity_started_at",
-    "current_activity_started_at DATETIME NULL AFTER current_activity_index"
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS event_timeline_items (
+      id VARCHAR(36) PRIMARY KEY,
+      event_id VARCHAR(36) NOT NULL,
+      type VARCHAR(24) NOT NULL,
+      activity_id VARCHAR(36) NULL,
+      presentation_id VARCHAR(36) NULL,
+      page_number INT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_timeline_event_order (event_id, sort_order),
+      INDEX idx_timeline_activity (activity_id),
+      CONSTRAINT fk_timeline_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+      CONSTRAINT fk_timeline_activity FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+      CONSTRAINT fk_timeline_presentation FOREIGN KEY (presentation_id) REFERENCES event_presentations(id) ON DELETE CASCADE
+    )`
   );
 
   await addColumnIfMissing(
@@ -162,36 +130,41 @@ export async function migrate() {
     "current_timeline_item_id",
     "current_timeline_item_id VARCHAR(36) NULL AFTER status"
   );
-
   await addColumnIfMissing(
     "live_sessions",
     "current_timeline_index",
     "current_timeline_index INT NOT NULL DEFAULT 0 AFTER current_timeline_item_id"
   );
-
   await addColumnIfMissing(
-    "event_presentations",
-    "page_sizes_json",
-    "page_sizes_json JSON NULL AFTER page_count"
+    "live_sessions",
+    "current_activity_started_at",
+    "current_activity_started_at DATETIME NULL AFTER current_activity_index"
   );
-
-  await addColumnIfMissing(
-    "activities",
-    "explanation",
-    "explanation TEXT NULL AFTER description"
-  );
-
-  await addColumnIfMissing(
-    "activities",
-    "time_limit_seconds",
-    "time_limit_seconds INT NOT NULL DEFAULT 0 AFTER explanation"
-  );
-
-  await pool.query("ALTER TABLE activities MODIFY COLUMN title TEXT NOT NULL");
-
   await addColumnIfMissing(
     "live_sessions",
     "completed_activity_ids",
     "completed_activity_ids JSON NULL AFTER current_activity_started_at"
   );
+  await addColumnIfMissing(
+    "live_sessions",
+    "show_participant_names",
+    "show_participant_names BOOLEAN NOT NULL DEFAULT FALSE AFTER show_results"
+  );
+
+  await addColumnIfMissing("activities", "explanation", "explanation TEXT NULL AFTER description");
+  await addColumnIfMissing(
+    "activities",
+    "time_limit_seconds",
+    "time_limit_seconds INT NOT NULL DEFAULT 0 AFTER explanation"
+  );
+  await addColumnIfMissing(
+    "event_presentations",
+    "page_sizes_json",
+    "page_sizes_json JSON NULL AFTER page_count"
+  );
+  await addColumnIfMissing("responses", "score", "score INT NOT NULL DEFAULT 0");
+
+  if (await tableExists("activities")) {
+    await pool.query("ALTER TABLE activities MODIFY COLUMN title TEXT NOT NULL");
+  }
 }

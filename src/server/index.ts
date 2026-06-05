@@ -1,12 +1,22 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
+import { logger } from "hono/logger";
 import { createBunWebSocket, serveStatic } from "hono/bun";
+import * as XLSX from "xlsx";
 import { mkdir, readdir, unlink } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { env, assertRuntimeConfig } from "./env";
-import { migrate } from "./db";
+import { migrate, pool } from "./db";
+import {
+  closeRedis,
+  presenceRemove,
+  presenceTouch,
+  rateLimitHit,
+  redisEnabled,
+  redisPing
+} from "./redis";
 import {
   isAdminRequest,
   issueAdminToken,
@@ -24,6 +34,7 @@ import {
   deleteEvent,
   deleteEventPresentation,
   endLiveSession,
+  exportEventData,
   getActivity,
   getEvent,
   getEventPresentation,
@@ -34,6 +45,7 @@ import {
   listEvents,
   listMessages,
   moderateMessage,
+  PRESENCE_TTL_SECONDS,
   reorderActivities,
   reorderTimelineItems,
   saveEventPresentation,
@@ -69,7 +81,6 @@ interface SocketClient {
 
 const clients = new Map<string, SocketClient>();
 const rooms = new Map<string, Set<string>>();
-const messageRateLimits = new Map<string, number>();
 const revealTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const presentationUploadRoot = join(import.meta.dir, "..", "..", "uploads", "presentations");
 
@@ -354,6 +365,16 @@ function removeClient(clientId: string) {
   if (room?.size === 0) rooms.delete(client.liveId);
 }
 
+function handleDisconnect(clientId: string) {
+  const client = clients.get(clientId);
+  removeClient(clientId);
+  if (client?.participantId) {
+    void presenceRemove(client.liveId, client.participantId)
+      .then(() => broadcastParticipantCount(client.liveId))
+      .catch(() => {});
+  }
+}
+
 function send(client: SocketClient, message: SocketMessage) {
   client.ws.send(JSON.stringify(message));
 }
@@ -502,6 +523,9 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "participant" || !client.participantId) {
         throw new Error("Only participants can submit answers.");
       }
+      if (!(await allowRateLimit(`rl:ans:${client.participantId}`, 10, 5))) {
+        throw new Error("作答太頻繁,請稍候再試。");
+      }
       const payload = message.payload as any;
       const response = await submitAnswer({
         liveId: client.liveId,
@@ -562,11 +586,9 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "participant" || !client.participantId) {
         throw new Error("Only participants can send messages.");
       }
-      const lastSentAt = messageRateLimits.get(client.participantId) ?? 0;
-      if (Date.now() - lastSentAt < 2000) {
+      if (!(await allowRateLimit(`rl:msg:${client.participantId}`, 1, 2))) {
         throw new Error("Please wait before sending another message.");
       }
-      messageRateLimits.set(client.participantId, Date.now());
       const payload = message.payload as any;
       const newMessage = await createMessage({
         liveId: client.liveId,
@@ -620,12 +642,87 @@ async function routeJson<T>(
   }
 }
 
+// Flatten an event export to CSV: one row per recorded answer. Prefixed with a
+// UTF-8 BOM so Excel opens Chinese text correctly.
+function exportToCsv(data: Awaited<ReturnType<typeof exportEventData>>): string {
+  if (!data) return "";
+  const header = [
+    "join_code",
+    "question_number",
+    "activity_title",
+    "activity_type",
+    "participant",
+    "answer",
+    "correct",
+    "score",
+    "received_at"
+  ];
+  const cell = (value: unknown) => {
+    const text = String(value ?? "");
+    return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  const lines = [header.join(",")];
+  for (const row of data.responses) {
+    lines.push(
+      [
+        row.joinCode,
+        row.questionNumber ?? "",
+        row.activityTitle,
+        row.activityType,
+        row.nickname,
+        row.answer,
+        row.correct,
+        row.score,
+        row.receivedAt
+      ]
+        .map(cell)
+        .join(",")
+    );
+  }
+  return "﻿" + lines.join("\r\n");
+}
+
+// Build an .xlsx workbook from an event export: a "作答紀錄" sheet (one row per
+// answer) plus a "題目" sheet listing the questions. Returns the file bytes.
+function exportToXlsx(data: NonNullable<Awaited<ReturnType<typeof exportEventData>>>): Uint8Array {
+  const responseRows = data.responses.map((row) => ({
+    場次代碼: row.joinCode,
+    題號: row.questionNumber ?? "",
+    題目: row.activityTitle,
+    題型: row.activityType,
+    參與者: row.nickname,
+    答案: row.answer,
+    答對: row.correct ? "是" : "否",
+    分數: row.score,
+    作答時間: row.receivedAt
+  }));
+  const activityRows = data.activities.map((activity) => ({
+    題號: activity.sortOrder + 1,
+    題目: activity.title,
+    題型: activity.type,
+    秒數: activity.timeLimitSeconds
+  }));
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.json_to_sheet(responseRows.length ? responseRows : [{ 場次代碼: "", 題號: "", 題目: "", 題型: "", 參與者: "", 答案: "", 答對: "", 分數: "", 作答時間: "" }]),
+    "作答紀錄"
+  );
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(activityRows), "題目");
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Uint8Array;
+}
+
 async function participantFromRequest(c: Context) {
   const token =
     c.req.header("x-participant-token") ?? tokenFromAuthorization(c.req.header("authorization"));
   if (!token) return null;
   return authenticateParticipant(token);
 }
+
+// Skip the every-10s /healthz probe to keep request logs (and disk) low-noise.
+const requestLogger = logger();
+app.use("*", (c, next) => (c.req.path === "/healthz" ? next() : requestLogger(c, next)));
 
 app.use(
   "*",
@@ -636,6 +733,22 @@ app.use(
     credentials: true
   })
 );
+
+function clientIp(c: Context) {
+  const forwarded = c.req.header("x-forwarded-for");
+  if (forwarded) return forwarded.split(",")[0]!.trim();
+  return c.req.header("x-real-ip") ?? "unknown";
+}
+
+/**
+ * Fixed-window rate limit backed by Redis. Returns true when the request is
+ * allowed. Fails open (allows) when Redis is unavailable — rate limiting is an
+ * optimisation/abuse-control layer, not a hard dependency.
+ */
+async function allowRateLimit(key: string, limit: number, windowSeconds: number) {
+  const count = await rateLimitHit(key, windowSeconds);
+  return count === null || count <= limit;
+}
 
 app.get("/api/health", (c) => c.json({ ok: true, name: "slihoot" }));
 
@@ -718,6 +831,40 @@ app.get("/api/events/:eventId", requireAdmin, async (c) =>
     return event;
   })
 );
+
+app.get("/api/events/:eventId/export", requireAdmin, async (c) => {
+  const eventId = c.req.param("eventId")!;
+  const data = await exportEventData(eventId);
+  if (!data) return c.json({ error: "Event not found." }, 404);
+
+  const format = c.req.query("format");
+  const ext = format === "csv" ? "csv" : format === "xlsx" ? "xlsx" : "json";
+  // HTTP header values must be ASCII, so keep a safe ASCII `filename` and offer
+  // the (possibly non-ASCII) event title via RFC 5987 `filename*`.
+  const asciiSlug = data.event.title.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const asciiName = `slihoot-${asciiSlug || eventId}.${ext}`;
+  const niceName = encodeURIComponent(`slihoot-${data.event.title || eventId}.${ext}`);
+  const disposition = `attachment; filename="${asciiName}"; filename*=UTF-8''${niceName}`;
+
+  if (ext === "xlsx") {
+    return new Response(exportToXlsx(data) as unknown as BodyInit, {
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": disposition
+      }
+    });
+  }
+
+  if (ext === "csv") {
+    return new Response(exportToCsv(data), {
+      headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": disposition }
+    });
+  }
+
+  return new Response(JSON.stringify(data, null, 2), {
+    headers: { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": disposition }
+  });
+});
 
 app.put("/api/events/:eventId", requireAdmin, async (c) =>
   routeJson(c, async () => {
@@ -876,6 +1023,9 @@ app.post("/api/live-sessions/:liveId/end", requireAdmin, async (c) =>
 
 app.post("/api/live-sessions/join", async (c) =>
   routeJson(c, async () => {
+    if (!(await allowRateLimit(`rl:join:${clientIp(c)}`, env.rateLimit.joinPerMinute, 60))) {
+      throw new Error("加入太頻繁,請稍候再試。");
+    }
     const joined = await joinLiveSession(await readBody(c));
     if (!joined) throw new Error("Live session not found.");
     return joined;
@@ -939,6 +1089,7 @@ app.get(
             participantName: participant.nickname
           };
           addClient(client);
+          await presenceTouch(liveId, participant.id, PRESENCE_TTL_SECONDS);
           await broadcastState(liveId);
           await broadcastParticipantCount(liveId);
           await scheduleReveal(liveId);
@@ -966,14 +1117,34 @@ app.get(
         }
       },
       onClose() {
-        removeClient(clientId);
+        handleDisconnect(clientId);
       },
       onError() {
-        removeClient(clientId);
+        handleDisconnect(clientId);
       }
     };
   })
 );
+
+app.get("/healthz", async (c) => {
+  const checks = { mysql: false, redis: false };
+
+  try {
+    await pool.query("SELECT 1");
+    checks.mysql = true;
+  } catch {
+    checks.mysql = false;
+  }
+
+  checks.redis = redisEnabled ? await redisPing() : false;
+
+  // MySQL is the hard dependency; Redis is an optional optimisation layer.
+  const ok = checks.mysql;
+  return c.json(
+    { status: ok ? "ok" : "degraded", redisEnabled, checks },
+    ok ? 200 : 503
+  );
+});
 
 app.use("/assets/*", serveStatic({ root: "./dist" }));
 app.get("*", serveStatic({ root: "./dist", path: "index.html" }));
@@ -985,10 +1156,60 @@ if (env.autoMigrate) {
   console.log("[slihoot] database migrations are up to date.");
 }
 
-Bun.serve({
+// Presence heartbeat: refresh the online TTL for every connected participant so
+// Redis presence reflects live connections without requiring client changes.
+const heartbeat = setInterval(() => {
+  for (const client of clients.values()) {
+    if (client.participantId) {
+      void presenceTouch(client.liveId, client.participantId, PRESENCE_TTL_SECONDS);
+    }
+  }
+}, 30_000);
+
+const server = Bun.serve({
   port: env.port,
   fetch: app.fetch,
   websocket
 });
+
+// Graceful shutdown: on SIGTERM/SIGINT (e.g. `docker compose stop` or a deploy
+// restart), stop accepting connections and release MySQL/Redis cleanly so we
+// don't drop sockets mid-write or leak pooled connections.
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[slihoot] received ${signal}, shutting down gracefully...`);
+
+  clearInterval(heartbeat);
+  for (const timer of revealTimers.values()) clearTimeout(timer);
+  revealTimers.clear();
+
+  for (const client of clients.values()) {
+    try {
+      client.ws.close(1001, "server shutting down");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  try {
+    await server.stop(true);
+  } catch {
+    /* ignore */
+  }
+  try {
+    await pool.end();
+  } catch {
+    /* ignore */
+  }
+  closeRedis();
+
+  console.log("[slihoot] shutdown complete.");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 console.log(`[slihoot] listening on http://localhost:${env.port}`);

@@ -1,0 +1,14 @@
+# Reverse proxy + automatic HTTPS for slihoot.
+#
+# DOMAIN is injected from docker-compose:
+#   - a real hostname (e.g. quiz.example.com) -> Caddy obtains a Let's Encrypt
+#     certificate automatically and serves HTTPS.
+#   - unset -> ":80", i.e. plain HTTP, useful for local/testing.
+#
+# reverse_proxy transparently forwards WebSocket upgrades (the /ws endpoint),
+# so the live session connections work over wss:// once a domain is set.
+
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:3000
+}

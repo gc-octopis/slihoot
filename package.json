@@ -8,6 +8,8 @@
     "dev:web": "bunx vite --host 0.0.0.0",
     "build": "bunx vite build",
     "start": "bun src/server/index.ts",
+    "loadtest": "bun scripts/loadtest.ts",
+    "smoke": "bun scripts/smoke.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
@@ -17,7 +19,8 @@
     "qrcode.react": "^4.2.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/bun": "^1.2.14",
@@ -26,4 +29,3 @@
     "typescript": "^5.8.3"
   }
 }
-

@@ -1,8 +1,19 @@
+# Default logging: cap container logs so disk usage stays bounded (observability ⑦).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   app:
     build: .
+    restart: unless-stopped
+    logging: *default-logging
+    # Not published to the public interface — Caddy fronts it. Bound to
+    # localhost only for host-side debugging.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       PORT: 3000
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
@@ -10,30 +21,75 @@ services:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: slihoot
-      DB_PASSWORD: slihoot
+      DB_PASSWORD: ${DB_PASSWORD:-slihoot}
       DB_NAME: slihoot
       DB_AUTO_MIGRATE: "true"
+      REDIS_URL: redis://redis:6379
     depends_on:
       mysql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    # Set DOMAIN to a real hostname for automatic HTTPS (Let's Encrypt).
+    # Left unset it serves plain HTTP on :80 — handy for local/testing.
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
 
   mysql:
     image: mysql:8.4
+    restart: unless-stopped
+    logging: *default-logging
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: slihoot
       MYSQL_USER: slihoot
-      MYSQL_PASSWORD: slihoot
+      MYSQL_PASSWORD: ${DB_PASSWORD:-slihoot}
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uslihoot", "-pslihoot"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uslihoot", "-p${DB_PASSWORD:-slihoot}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    # Pure cache role: no on-disk persistence, capped memory with LRU eviction.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      # Bound to localhost only — never expose Redis to the public network.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
 
 volumes:
   mysql-data:
-
+  caddy-data:
+  caddy-config:
