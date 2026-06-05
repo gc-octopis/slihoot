@@ -1,6 +1,7 @@
 export type ActivityType = "multiple_choice" | "true_false" | "short_answer" | "word_cloud";
 export type LiveStatus = "waiting" | "active" | "ended";
 export type MessageStatus = "visible" | "hidden" | "deleted";
+export type TimelineItemType = "pdf_page" | "activity";
 
 export interface EventRecord {
   id: string;
@@ -25,7 +26,37 @@ export interface ActivityRecord {
   timeLimitSeconds: number;
   options: ActivityOption[];
   correctAnswer: unknown;
+  allowRepeatAnswers?: boolean;
   sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EventPresentationRecord {
+  id: string;
+  eventId: string;
+  originalName: string;
+  storedName: string;
+  mimeType: string;
+  fileSize: number;
+  pageCount: number;
+  pageSizes: Array<{
+    width: number;
+    height: number;
+  }>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TimelineItemRecord {
+  id: string;
+  eventId: string;
+  type: TimelineItemType;
+  activityId: string | null;
+  presentationId: string | null;
+  pageNumber: number | null;
+  sortOrder: number;
+  activity?: ActivityRecord | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -43,6 +74,8 @@ export interface LiveSessionRecord {
   eventId: string;
   joinCode: string;
   status: LiveStatus;
+  currentTimelineItemId: string | null;
+  currentTimelineIndex: number;
   currentActivityId: string | null;
   currentActivityIndex: number;
   currentActivityStartedAt: string | null;
@@ -113,6 +146,9 @@ export interface LiveState {
   liveSession: LiveSessionRecord;
   event: EventRecord;
   activities?: ActivityRecord[];
+  timeline?: TimelineItemRecord[];
+  presentation?: EventPresentationRecord | null;
+  currentTimelineItem: TimelineItemRecord | null;
   currentActivity: ActivityRecord | null;
   participantCount: number;
   responseSummary: ResponseSummary | null;

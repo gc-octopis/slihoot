@@ -3,17 +3,20 @@ import type {
   ActivityRecord,
   ActivityType,
   EventRecord,
+  EventPresentationRecord,
   LiveMessageRecord,
   LiveSessionRecord,
   LiveState,
   MessageStatus,
   ParticipantRecord,
   ResponseRecord,
-  ResponseSummary
+  ResponseSummary,
+  TimelineItemRecord
 } from "./types";
 import { pool } from "./db";
 
 const activityTypes: ActivityType[] = ["multiple_choice", "true_false", "short_answer", "word_cloud"];
+type DbExecutor = Pick<typeof pool, "execute">;
 
 function id() {
   return crypto.randomUUID();
@@ -108,9 +111,12 @@ function normalizeCorrectAnswer(
   options: ActivityOption[],
   correctAnswer: unknown
 ) {
-  if (type === "word_cloud") return null;
   const answerObject =
     typeof correctAnswer === "object" && correctAnswer !== null ? (correctAnswer as any) : {};
+
+  if (type === "word_cloud") {
+    return { allowRepeatAnswers: Boolean(answerObject.allowRepeatAnswers) };
+  }
 
   if (type === "short_answer") {
     const text = normalizeText(answerObject.text ?? correctAnswer, 500);
@@ -137,6 +143,7 @@ function rowToEvent(row: any): EventRecord {
 }
 
 function rowToActivity(row: any): ActivityRecord {
+  const correctAnswer = parseJson(row.correctAnswerJson, null);
   return {
     id: row.id,
     eventId: row.eventId,
@@ -146,8 +153,60 @@ function rowToActivity(row: any): ActivityRecord {
     explanation: row.explanation ?? "",
     timeLimitSeconds: Number(row.timeLimitSeconds ?? 0),
     options: parseJson<ActivityOption[]>(row.optionsJson, []),
-    correctAnswer: parseJson(row.correctAnswerJson, null),
+    correctAnswer,
+    allowRepeatAnswers:
+      row.type === "word_cloud" &&
+      typeof correctAnswer === "object" &&
+      correctAnswer !== null
+        ? Boolean((correctAnswer as { allowRepeatAnswers?: unknown }).allowRepeatAnswers)
+        : undefined,
     sortOrder: Number(row.sortOrder ?? 0),
+    createdAt: toIso(row.createdAt),
+    updatedAt: toIso(row.updatedAt)
+  };
+}
+
+function rowToPresentation(row: any): EventPresentationRecord {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    originalName: row.originalName,
+    storedName: row.storedName,
+    mimeType: row.mimeType,
+    fileSize: Number(row.fileSize ?? 0),
+    pageCount: Number(row.pageCount ?? 0),
+    pageSizes: parseJson<Array<{ width: number; height: number }>>(row.pageSizesJson, []),
+    createdAt: toIso(row.createdAt),
+    updatedAt: toIso(row.updatedAt)
+  };
+}
+
+function rowToTimelineItem(row: any): TimelineItemRecord {
+  const hasActivity = Boolean(row.activityRecordId);
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    type: row.type,
+    activityId: row.activityId ?? null,
+    presentationId: row.presentationId ?? null,
+    pageNumber: row.pageNumber === null || row.pageNumber === undefined ? null : Number(row.pageNumber),
+    sortOrder: Number(row.sortOrder ?? 0),
+    activity: hasActivity
+      ? rowToActivity({
+          id: row.activityRecordId,
+          eventId: row.activityEventId,
+          type: row.activityType,
+          title: row.activityTitle,
+          description: row.activityDescription,
+          explanation: row.activityExplanation,
+          timeLimitSeconds: row.activityTimeLimitSeconds,
+          optionsJson: row.activityOptionsJson,
+          correctAnswerJson: row.activityCorrectAnswerJson,
+          sortOrder: row.activitySortOrder,
+          createdAt: row.activityCreatedAt,
+          updatedAt: row.activityUpdatedAt
+        })
+      : null,
     createdAt: toIso(row.createdAt),
     updatedAt: toIso(row.updatedAt)
   };
@@ -159,6 +218,8 @@ function rowToLiveSession(row: any): LiveSessionRecord {
     eventId: row.eventId,
     joinCode: row.joinCode,
     status: row.status,
+    currentTimelineItemId: row.currentTimelineItemId ?? null,
+    currentTimelineIndex: Number(row.currentTimelineIndex ?? 0),
     currentActivityId: row.currentActivityId,
     currentActivityIndex: Number(row.currentActivityIndex ?? 0),
     currentActivityStartedAt: row.currentActivityStartedAt ? toIso(row.currentActivityStartedAt) : null,
@@ -222,6 +283,301 @@ function clampTimeLimit(value: unknown) {
   const seconds = Math.floor(Number(value));
   if (!Number.isFinite(seconds) || seconds <= 0) return 0;
   return Math.min(seconds, 3600);
+}
+
+async function listTimelineItemsRaw(eventId: string, connection: DbExecutor = pool) {
+  const [rows] = await connection.execute(
+    `SELECT id, sort_order AS sortOrder
+     FROM event_timeline_items
+     WHERE event_id = :eventId
+     ORDER BY sort_order ASC, created_at ASC`,
+    { eventId }
+  );
+  return rows as Array<{ id: string; sortOrder: number }>;
+}
+
+async function updateTimelineSortOrders(
+  eventId: string,
+  orderedIds: string[],
+  connection: DbExecutor = pool
+) {
+  for (const [index, itemId] of orderedIds.entries()) {
+    await connection.execute(
+      `UPDATE event_timeline_items
+       SET sort_order = :sortOrder
+       WHERE id = :itemId AND event_id = :eventId`,
+      { eventId, itemId, sortOrder: index }
+    );
+  }
+}
+
+async function syncActivitySortOrders(eventId: string, connection: DbExecutor = pool) {
+  const [rows] = await connection.execute(
+    `SELECT activity_id AS activityId
+     FROM event_timeline_items
+     WHERE event_id = :eventId AND type = 'activity' AND activity_id IS NOT NULL
+     ORDER BY sort_order ASC, created_at ASC`,
+    { eventId }
+  );
+
+  for (const [index, row] of (rows as any[]).entries()) {
+    await connection.execute(
+      `UPDATE activities
+       SET sort_order = :sortOrder
+       WHERE id = :activityId AND event_id = :eventId`,
+      { eventId, activityId: row.activityId, sortOrder: index }
+    );
+  }
+}
+
+export async function getEventPresentation(eventId: string) {
+  const [rows] = await pool.execute(
+    `SELECT
+      id,
+      event_id AS eventId,
+      original_name AS originalName,
+      stored_name AS storedName,
+      mime_type AS mimeType,
+      file_size AS fileSize,
+      page_count AS pageCount,
+      page_sizes_json AS pageSizesJson,
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM event_presentations
+    WHERE event_id = :eventId
+    LIMIT 1`,
+    { eventId }
+  );
+  const row = (rows as any[])[0];
+  return row ? rowToPresentation(row) : null;
+}
+
+export async function listTimeline(eventId: string) {
+  await ensureTimeline(eventId);
+
+  const [rows] = await pool.execute(
+    `SELECT
+      ti.id,
+      ti.event_id AS eventId,
+      ti.type,
+      ti.activity_id AS activityId,
+      ti.presentation_id AS presentationId,
+      ti.page_number AS pageNumber,
+      ti.sort_order AS sortOrder,
+      ti.created_at AS createdAt,
+      ti.updated_at AS updatedAt,
+      a.id AS activityRecordId,
+      a.event_id AS activityEventId,
+      a.type AS activityType,
+      a.title AS activityTitle,
+      a.description AS activityDescription,
+      a.explanation AS activityExplanation,
+      a.time_limit_seconds AS activityTimeLimitSeconds,
+      a.options_json AS activityOptionsJson,
+      a.correct_answer_json AS activityCorrectAnswerJson,
+      a.sort_order AS activitySortOrder,
+      a.created_at AS activityCreatedAt,
+      a.updated_at AS activityUpdatedAt
+    FROM event_timeline_items ti
+    LEFT JOIN activities a ON a.id = ti.activity_id
+    WHERE ti.event_id = :eventId
+    ORDER BY ti.sort_order ASC, ti.created_at ASC`,
+    { eventId }
+  );
+
+  return (rows as any[]).map(rowToTimelineItem);
+}
+
+async function ensureTimeline(eventId: string) {
+  const [countRows] = await pool.execute(
+    `SELECT COUNT(*) AS total FROM event_timeline_items WHERE event_id = :eventId`,
+    { eventId }
+  );
+  if (Number((countRows as any[])[0]?.total ?? 0) > 0) return;
+
+  const activities = await listActivities(eventId);
+  if (activities.length === 0) return;
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const [index, activity] of activities.entries()) {
+      await connection.execute(
+        `INSERT INTO event_timeline_items
+          (id, event_id, type, activity_id, presentation_id, page_number, sort_order)
+         VALUES
+          (:id, :eventId, 'activity', :activityId, NULL, NULL, :sortOrder)`,
+        {
+          id: id(),
+          eventId,
+          activityId: activity.id,
+          sortOrder: index
+        }
+      );
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function insertTimelineItem(
+  eventId: string,
+  item: {
+    id: string;
+    type: "pdf_page" | "activity";
+    activityId?: string | null;
+    presentationId?: string | null;
+    pageNumber?: number | null;
+  },
+  afterTimelineItemId?: string | null,
+  connection: DbExecutor = pool
+) {
+  const existing = await listTimelineItemsRaw(eventId, connection);
+  let insertIndex = existing.length;
+  if (afterTimelineItemId) {
+    const foundIndex = existing.findIndex((candidate) => candidate.id === afterTimelineItemId);
+    if (foundIndex === -1) throw new Error("Timeline insertion point not found.");
+    insertIndex = foundIndex + 1;
+  }
+
+  await connection.execute(
+    `INSERT INTO event_timeline_items
+      (id, event_id, type, activity_id, presentation_id, page_number, sort_order)
+     VALUES
+      (:id, :eventId, :type, :activityId, :presentationId, :pageNumber, :sortOrder)`,
+    {
+      id: item.id,
+      eventId,
+      type: item.type,
+      activityId: item.activityId ?? null,
+      presentationId: item.presentationId ?? null,
+      pageNumber: item.pageNumber ?? null,
+      sortOrder: insertIndex
+    }
+  );
+
+  const orderedIds = existing.map((candidate) => candidate.id);
+  orderedIds.splice(insertIndex, 0, item.id);
+  await updateTimelineSortOrders(eventId, orderedIds, connection);
+}
+
+export async function saveEventPresentation(input: {
+  eventId: string;
+  originalName: string;
+  storedName: string;
+  mimeType: string;
+  fileSize: number;
+  pageCount: number;
+  pageSizes: Array<{ width: number; height: number }>;
+}) {
+  const event = await getEvent(input.eventId);
+  if (!event) return null;
+
+  const presentationId = id();
+  const pageCount = Math.max(1, Math.min(Math.floor(input.pageCount) || 1, 1000));
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    await connection.execute(
+      `DELETE FROM event_timeline_items
+       WHERE event_id = :eventId AND type = 'pdf_page'`,
+      { eventId: input.eventId }
+    );
+
+    await connection.execute(`DELETE FROM event_presentations WHERE event_id = :eventId`, {
+      eventId: input.eventId
+    });
+
+    await connection.execute(
+      `INSERT INTO event_presentations
+        (id, event_id, original_name, stored_name, mime_type, file_size, page_count, page_sizes_json)
+       VALUES
+        (:id, :eventId, :originalName, :storedName, :mimeType, :fileSize, :pageCount, :pageSizesJson)`,
+      {
+        id: presentationId,
+        eventId: input.eventId,
+        originalName: normalizeText(input.originalName, 255) || "presentation.pdf",
+        storedName: input.storedName,
+        mimeType: normalizeText(input.mimeType, 120) || "application/pdf",
+        fileSize: Math.max(0, Math.floor(input.fileSize) || 0),
+        pageCount,
+        pageSizesJson: stringifyJson(input.pageSizes.slice(0, pageCount))
+      }
+    );
+
+    const activityItems = await listTimelineItemsRaw(input.eventId, connection);
+    const pageItemIds: string[] = [];
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+      const itemId = id();
+      pageItemIds.push(itemId);
+      await connection.execute(
+        `INSERT INTO event_timeline_items
+          (id, event_id, type, activity_id, presentation_id, page_number, sort_order)
+         VALUES
+          (:id, :eventId, 'pdf_page', NULL, :presentationId, :pageNumber, :sortOrder)`,
+        {
+          id: itemId,
+          eventId: input.eventId,
+          presentationId,
+          pageNumber,
+          sortOrder: pageNumber - 1
+        }
+      );
+    }
+
+    await updateTimelineSortOrders(
+      input.eventId,
+      [...pageItemIds, ...activityItems.map((item) => item.id)],
+      connection
+    );
+    await syncActivitySortOrders(input.eventId, connection);
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  return getEvent(input.eventId);
+}
+
+export async function deleteEventPresentation(eventId: string) {
+  const event = await getEvent(eventId);
+  if (!event) return null;
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    await connection.execute(
+      `DELETE FROM event_timeline_items
+       WHERE event_id = :eventId AND type = 'pdf_page'`,
+      { eventId }
+    );
+
+    await connection.execute(`DELETE FROM event_presentations WHERE event_id = :eventId`, {
+      eventId
+    });
+
+    await syncActivitySortOrders(eventId, connection);
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  return getEvent(eventId);
 }
 
 export async function listEvents() {
@@ -306,9 +662,13 @@ export async function getEvent(eventId: string) {
   if (!row) return null;
 
   const activities = await listActivities(eventId);
+  const presentation = await getEventPresentation(eventId);
+  const timeline = await listTimeline(eventId);
   return {
     ...rowToEvent(row),
-    activities
+    activities,
+    presentation,
+    timeline
   };
 }
 
@@ -367,10 +727,13 @@ export async function createActivity(
     timeLimitSeconds?: unknown;
     options?: unknown;
     correctAnswer?: unknown;
+    insertAfterTimelineItemId?: unknown;
   }
 ) {
+  await ensureTimeline(eventId);
+
   const type = assertActivityType(input.type);
-  const title = normalizeText(input.title, 200) || "未命名題目";
+  const title = normalizeText(input.title, 60000) || "未命名題目";
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
@@ -385,31 +748,58 @@ export async function createActivity(
     throw new Error("請先設定正確答案再新增題目。");
   }
 
-  const [maxRows] = await pool.execute(
-    `SELECT COALESCE(MAX(sort_order), -1) + 1 AS nextOrder FROM activities WHERE event_id = :eventId`,
-    { eventId }
-  );
-  const sortOrder = Number((maxRows as any[])[0]?.nextOrder ?? 0);
   const activityId = id();
+  const timelineItemId = id();
+  const insertAfterTimelineItemId = normalizeText(input.insertAfterTimelineItemId, 80) || null;
+  const connection = await pool.getConnection();
 
-  await pool.execute(
-    `INSERT INTO activities
-      (id, event_id, type, title, description, explanation, time_limit_seconds, options_json, correct_answer_json, sort_order)
-     VALUES
-      (:id, :eventId, :type, :title, :description, :explanation, :timeLimitSeconds, :optionsJson, :correctAnswerJson, :sortOrder)`,
-    {
-      id: activityId,
+  try {
+    await connection.beginTransaction();
+
+    const [maxRows] = await connection.execute(
+      `SELECT COALESCE(MAX(sort_order), -1) + 1 AS nextOrder FROM activities WHERE event_id = :eventId`,
+      { eventId }
+    );
+    const sortOrder = Number((maxRows as any[])[0]?.nextOrder ?? 0);
+
+    await connection.execute(
+      `INSERT INTO activities
+        (id, event_id, type, title, description, explanation, time_limit_seconds, options_json, correct_answer_json, sort_order)
+       VALUES
+        (:id, :eventId, :type, :title, :description, :explanation, :timeLimitSeconds, :optionsJson, :correctAnswerJson, :sortOrder)`,
+      {
+        id: activityId,
+        eventId,
+        type,
+        title,
+        description,
+        explanation,
+        timeLimitSeconds,
+        optionsJson: stringifyJson(options),
+        correctAnswerJson: stringifyJson(correctAnswer),
+        sortOrder
+      }
+    );
+
+    await insertTimelineItem(
       eventId,
-      type,
-      title,
-      description,
-      explanation,
-      timeLimitSeconds,
-      optionsJson: stringifyJson(options),
-      correctAnswerJson: stringifyJson(correctAnswer),
-      sortOrder
-    }
-  );
+      {
+        id: timelineItemId,
+        type: "activity",
+        activityId
+      },
+      insertAfterTimelineItemId,
+      connection
+    );
+    await syncActivitySortOrders(eventId, connection);
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 
   return getActivity(activityId);
 }
@@ -450,7 +840,7 @@ export async function updateActivity(
   }
 ) {
   const type = assertActivityType(input.type);
-  const title = normalizeText(input.title, 200) || "未命名題目";
+  const title = normalizeText(input.title, 60000) || "未命名題目";
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
@@ -491,13 +881,16 @@ export async function updateActivity(
 }
 
 export async function deleteActivity(activityId: string) {
+  const activity = await getActivity(activityId);
   const [result] = await pool.execute(`DELETE FROM activities WHERE id = :activityId`, {
     activityId
   });
+  if (activity) await syncActivitySortOrders(activity.eventId);
   return (result as any).affectedRows > 0;
 }
 
 export async function reorderActivities(eventId: string, activityIds: string[]) {
+  await ensureTimeline(eventId);
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -506,6 +899,22 @@ export async function reorderActivities(eventId: string, activityIds: string[]) 
         `UPDATE activities SET sort_order = :sortOrder WHERE id = :activityId AND event_id = :eventId`,
         { sortOrder: index, activityId, eventId }
       );
+    }
+    const presentation = await getEventPresentation(eventId);
+    if (!presentation) {
+      const [rows] = await connection.execute(
+        `SELECT id, activity_id AS activityId
+         FROM event_timeline_items
+         WHERE event_id = :eventId AND type = 'activity'`,
+        { eventId }
+      );
+      const itemByActivityId = new Map(
+        (rows as any[]).map((row) => [String(row.activityId), String(row.id)])
+      );
+      const orderedTimelineIds = activityIds
+        .map((activityId) => itemByActivityId.get(activityId))
+        .filter(Boolean) as string[];
+      await updateTimelineSortOrders(eventId, orderedTimelineIds, connection);
     }
     await connection.commit();
   } catch (error) {
@@ -516,6 +925,48 @@ export async function reorderActivities(eventId: string, activityIds: string[]) 
   }
 
   return listActivities(eventId);
+}
+
+export async function reorderTimelineItems(eventId: string, timelineItemIds: string[]) {
+  await ensureTimeline(eventId);
+
+  const currentItems = await listTimeline(eventId);
+  const currentIds = currentItems.map((item) => item.id);
+  const requestedIds = timelineItemIds.map((itemId) => normalizeText(itemId, 80)).filter(Boolean);
+
+  if (requestedIds.length !== currentIds.length) {
+    throw new Error("Timeline item list is incomplete.");
+  }
+
+  const currentSet = new Set(currentIds);
+  const requestedSet = new Set(requestedIds);
+  if (requestedSet.size !== requestedIds.length || requestedIds.some((itemId) => !currentSet.has(itemId))) {
+    throw new Error("Timeline item list is invalid.");
+  }
+
+  const currentPdfIds = currentItems
+    .filter((item) => item.type === "pdf_page")
+    .map((item) => item.id);
+  const currentPdfSet = new Set(currentPdfIds);
+  const requestedPdfIds = requestedIds.filter((itemId) => currentPdfSet.has(itemId));
+  if (requestedPdfIds.join("|") !== currentPdfIds.join("|")) {
+    throw new Error("PDF slide order cannot be changed.");
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await updateTimelineSortOrders(eventId, requestedIds, connection);
+    await syncActivitySortOrders(eventId, connection);
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  return listTimeline(eventId);
 }
 
 async function uniqueJoinCode() {
@@ -546,20 +997,29 @@ export async function startLiveSession(eventId: string) {
   if (activeLiveId) return getLiveSession(activeLiveId);
 
   const activities = await listActivities(eventId);
-  const firstActivity = activities[0] ?? null;
+  const timeline = await listTimeline(eventId);
+  const firstItem = timeline[0] ?? null;
+  const firstActivity =
+    firstItem?.type === "activity"
+      ? activities.find((activity) => activity.id === firstItem.activityId) ?? null
+      : null;
   const liveId = id();
   const joinCode = await uniqueJoinCode();
 
   await pool.execute(
     `INSERT INTO live_sessions
-      (id, event_id, join_code, status, current_activity_id, current_activity_index, current_activity_started_at, show_results, started_at)
+      (id, event_id, join_code, status, current_timeline_item_id, current_timeline_index, current_activity_id, current_activity_index, current_activity_started_at, show_results, started_at)
      VALUES
-      (:id, :eventId, :joinCode, 'active', :currentActivityId, 0, :currentActivityStartedAt, FALSE, :startedAt)`,
+      (:id, :eventId, :joinCode, 'active', :currentTimelineItemId, 0, :currentActivityId, :currentActivityIndex, :currentActivityStartedAt, FALSE, :startedAt)`,
     {
       id: liveId,
       eventId,
       joinCode,
+      currentTimelineItemId: firstItem?.id ?? null,
       currentActivityId: firstActivity?.id ?? null,
+      currentActivityIndex: firstActivity
+        ? activities.findIndex((activity) => activity.id === firstActivity.id)
+        : 0,
       currentActivityStartedAt: null,
       startedAt: nowDate()
     }
@@ -575,6 +1035,8 @@ export async function getLiveSession(liveId: string) {
       event_id AS eventId,
       join_code AS joinCode,
       status,
+      current_timeline_item_id AS currentTimelineItemId,
+      current_timeline_index AS currentTimelineIndex,
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
@@ -601,13 +1063,23 @@ export async function endLiveSession(liveId: string) {
   return getLiveSession(liveId);
 }
 
-export async function setCurrentActivity(liveId: string, activityId: string) {
+export async function setCurrentTimelineItem(liveId: string, timelineItemId: string) {
   const liveSession = await getLiveSession(liveId);
   if (!liveSession) return null;
 
   const activities = await listActivities(liveSession.eventId);
-  const index = activities.findIndex((activity) => activity.id === activityId);
-  if (index === -1) throw new Error("Activity does not belong to this live session.");
+  const timeline = await listTimeline(liveSession.eventId);
+  const timelineIndex = timeline.findIndex((item) => item.id === timelineItemId);
+  if (timelineIndex === -1) throw new Error("Timeline item does not belong to this live session.");
+
+  const timelineItem = timeline[timelineIndex];
+  const activityId = timelineItem.type === "activity" ? timelineItem.activityId : null;
+  const activityIndex = activityId
+    ? activities.findIndex((activity) => activity.id === activityId)
+    : 0;
+  if (activityId && activityIndex === -1) {
+    throw new Error("Activity does not belong to this live session.");
+  }
 
   const completed = new Set(liveSession.completedActivityIds);
   if (
@@ -620,11 +1092,13 @@ export async function setCurrentActivity(liveId: string, activityId: string) {
 
   // A question that has already been answered must not re-arm its timer when
   // revisited. Keep it open but anchored in the past so it stays revealed/closed.
-  const startedAt = completed.has(activityId) ? new Date(0) : nowDate();
+  const startedAt = activityId ? (completed.has(activityId) ? new Date(0) : nowDate()) : null;
 
   await pool.execute(
     `UPDATE live_sessions
-     SET current_activity_id = :activityId,
+     SET current_timeline_item_id = :timelineItemId,
+         current_timeline_index = :timelineIndex,
+         current_activity_id = :activityId,
          current_activity_index = :activityIndex,
          current_activity_started_at = :startedAt,
          show_results = FALSE,
@@ -632,14 +1106,28 @@ export async function setCurrentActivity(liveId: string, activityId: string) {
      WHERE id = :liveId`,
     {
       liveId,
+      timelineItemId,
+      timelineIndex,
       activityId,
-      activityIndex: index,
+      activityIndex,
       startedAt,
       completedActivityIds: stringifyJson(Array.from(completed))
     }
   );
 
   return getLiveSession(liveId);
+}
+
+export async function setCurrentActivity(liveId: string, activityId: string) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession) return null;
+
+  const timeline = await listTimeline(liveSession.eventId);
+  const item = timeline.find(
+    (candidate) => candidate.type === "activity" && candidate.activityId === activityId
+  );
+  if (!item) throw new Error("Activity does not belong to this live session.");
+  return setCurrentTimelineItem(liveId, item.id);
 }
 
 export async function startActivity(liveId: string) {
@@ -684,6 +1172,8 @@ export async function joinLiveSession(input: { joinCode: unknown; nickname: unkn
       event_id AS eventId,
       join_code AS joinCode,
       status,
+      current_timeline_item_id AS currentTimelineItemId,
+      current_timeline_index AS currentTimelineIndex,
       current_activity_id AS currentActivityId,
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
@@ -820,6 +1310,11 @@ export async function submitAnswer(input: {
   const activity = await getActivity(input.activityId);
   if (!activity) throw new Error("Activity not found.");
 
+  const existingResponse = await getResponse(input.liveId, input.activityId, input.participantId);
+  if (activity.type === "word_cloud" && existingResponse && !activity.allowRepeatAnswers) {
+    throw new Error("這一題不開放重複填答。");
+  }
+
   const answer = validateAnswer(activity, input.answer);
   const responseId = id();
   const receivedAt = nowDate();
@@ -828,7 +1323,7 @@ export async function submitAnswer(input: {
       ? {
           texts: [
             ...extractWordCloudTexts(
-              (await getResponse(input.liveId, input.activityId, input.participantId))?.answer
+              activity.allowRepeatAnswers ? existingResponse?.answer : null
             ),
             answer.text
           ]
@@ -1022,12 +1517,24 @@ export async function getLiveState(
   if (!event) return null;
 
   const activities = await listActivities(liveSession.eventId);
-  const currentActivity =
-    activities.find((activity) => activity.id === liveSession.currentActivityId) ??
-    activities[liveSession.currentActivityIndex] ??
+  const timeline = await listTimeline(liveSession.eventId);
+  const presentation = await getEventPresentation(liveSession.eventId);
+  const currentTimelineItem =
+    timeline.find((item) => item.id === liveSession.currentTimelineItemId) ??
+    timeline[liveSession.currentTimelineIndex] ??
     null;
+  const currentActivity =
+    currentTimelineItem?.type === "activity"
+      ? currentTimelineItem.activity ??
+        activities.find((activity) => activity.id === currentTimelineItem.activityId) ??
+        null
+      : activities.find((activity) => activity.id === liveSession.currentActivityId) ??
+        (timeline.length === 0 ? activities[liveSession.currentActivityIndex] : null) ??
+        null;
 
-  const activityOpen = Boolean(currentActivity && liveSession.currentActivityStartedAt);
+  const activityOpen = Boolean(
+    currentActivity && liveSession.status !== "ended" && liveSession.currentActivityStartedAt
+  );
   const answerClosed = Boolean(
     currentActivity && liveSession.completedActivityIds.includes(currentActivity.id)
   );
@@ -1057,7 +1564,9 @@ export async function getLiveState(
       : undefined;
 
   const participantActivity =
-    !currentActivity || !activityOpen
+    viewer === "participant" && liveSession.status === "ended"
+      ? null
+      : !currentActivity || !activityOpen
       ? null
       : answerRevealed
         ? currentActivity
@@ -1073,6 +1582,9 @@ export async function getLiveState(
       updatedAt: event.updatedAt
     },
     activities: viewer === "admin" ? activities : undefined,
+    timeline: viewer === "admin" ? timeline : undefined,
+    presentation: viewer === "admin" ? presentation : undefined,
+    currentTimelineItem: viewer === "admin" ? currentTimelineItem : null,
     currentActivity: viewer === "admin" ? currentActivity : participantActivity,
     participantCount: await countParticipants(liveId),
     responseSummary,

@@ -24,7 +24,7 @@ const migrations = [
     id VARCHAR(36) PRIMARY KEY,
     event_id VARCHAR(36) NOT NULL,
     type VARCHAR(32) NOT NULL,
-    title VARCHAR(200) NOT NULL,
+    title TEXT NOT NULL,
     description TEXT NOT NULL,
     options_json JSON NULL,
     correct_answer_json JSON NULL,
@@ -34,11 +34,43 @@ const migrations = [
     INDEX idx_activities_event_order (event_id, sort_order),
     CONSTRAINT fk_activities_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
   )`,
+  `CREATE TABLE IF NOT EXISTS event_presentations (
+    id VARCHAR(36) PRIMARY KEY,
+    event_id VARCHAR(36) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(120) NOT NULL,
+    file_size BIGINT NOT NULL DEFAULT 0,
+    page_count INT NOT NULL DEFAULT 0,
+    page_sizes_json JSON NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_event_presentation (event_id),
+    CONSTRAINT fk_presentations_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS event_timeline_items (
+    id VARCHAR(36) PRIMARY KEY,
+    event_id VARCHAR(36) NOT NULL,
+    type VARCHAR(24) NOT NULL,
+    activity_id VARCHAR(36) NULL,
+    presentation_id VARCHAR(36) NULL,
+    page_number INT NULL,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_timeline_event_order (event_id, sort_order),
+    INDEX idx_timeline_activity (activity_id),
+    CONSTRAINT fk_timeline_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    CONSTRAINT fk_timeline_activity FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+    CONSTRAINT fk_timeline_presentation FOREIGN KEY (presentation_id) REFERENCES event_presentations(id) ON DELETE CASCADE
+  )`,
   `CREATE TABLE IF NOT EXISTS live_sessions (
     id VARCHAR(36) PRIMARY KEY,
     event_id VARCHAR(36) NOT NULL,
     join_code VARCHAR(8) NOT NULL UNIQUE,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
+    current_timeline_item_id VARCHAR(36) NULL,
+    current_timeline_index INT NOT NULL DEFAULT 0,
     current_activity_id VARCHAR(36) NULL,
     current_activity_index INT NOT NULL DEFAULT 0,
     show_results BOOLEAN NOT NULL DEFAULT FALSE,
@@ -126,6 +158,24 @@ export async function migrate() {
   );
 
   await addColumnIfMissing(
+    "live_sessions",
+    "current_timeline_item_id",
+    "current_timeline_item_id VARCHAR(36) NULL AFTER status"
+  );
+
+  await addColumnIfMissing(
+    "live_sessions",
+    "current_timeline_index",
+    "current_timeline_index INT NOT NULL DEFAULT 0 AFTER current_timeline_item_id"
+  );
+
+  await addColumnIfMissing(
+    "event_presentations",
+    "page_sizes_json",
+    "page_sizes_json JSON NULL AFTER page_count"
+  );
+
+  await addColumnIfMissing(
     "activities",
     "explanation",
     "explanation TEXT NULL AFTER description"
@@ -136,6 +186,8 @@ export async function migrate() {
     "time_limit_seconds",
     "time_limit_seconds INT NOT NULL DEFAULT 0 AFTER explanation"
   );
+
+  await pool.query("ALTER TABLE activities MODIFY COLUMN title TEXT NOT NULL");
 
   await addColumnIfMissing(
     "live_sessions",

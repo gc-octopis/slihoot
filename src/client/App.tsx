@@ -1,17 +1,19 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type {
   ActiveLiveSessionSummary,
   ActivityOption,
   ActivityRecord,
   ActivityType,
+  EventPresentationRecord,
   EventRecord,
   LiveMessageRecord,
   LiveSessionRecord,
   LiveState,
   ResponseRecord,
   ResponseSummary,
-  SocketMessage
+  SocketMessage,
+  TimelineItemRecord
 } from "../server/types";
 import {
   ADMIN_TOKEN_KEY,
@@ -29,12 +31,20 @@ type EventListItem = EventRecord & {
   activityCount: number;
   activeLiveSession: ActiveLiveSessionSummary | null;
 };
-type EventDetail = EventRecord & { activities: ActivityRecord[] };
+type EventDetail = EventRecord & {
+  activities: ActivityRecord[];
+  presentation: EventPresentationRecord | null;
+  timeline: TimelineItemRecord[];
+};
 type ActivityDraft = {
   type: ActivityType;
   title: string;
   description: string;
   explanation: string;
+  hasDescription: boolean;
+  hasExplanation: boolean;
+  hasTimeLimit: boolean;
+  allowRepeatAnswers: boolean;
   timeLimitSeconds: number;
   options: ActivityOption[];
   correctOptionId: string;
@@ -50,6 +60,107 @@ type TryCloudflareTunnelState = {
   lastError: string | null;
   logs: string[];
 };
+
+type PdfViewport = {
+  width: number;
+  height: number;
+};
+
+type PdfRenderTask = {
+  promise: Promise<void>;
+  cancel?: () => void;
+};
+
+type PdfPageProxy = {
+  getViewport(options: { scale: number }): PdfViewport;
+  render(options: {
+    canvasContext: CanvasRenderingContext2D;
+    viewport: PdfViewport;
+  }): PdfRenderTask;
+};
+
+type PdfDocumentProxy = {
+  numPages: number;
+  getPage(pageNumber: number): Promise<PdfPageProxy>;
+};
+
+type PdfJsModule = {
+  GlobalWorkerOptions: {
+    workerSrc: string;
+  };
+  getDocument(options: { url: string }): {
+    promise: Promise<PdfDocumentProxy>;
+  };
+};
+
+const PDFJS_MODULE_URL = "https://mozilla.github.io/pdf.js/build/pdf.mjs";
+const PDFJS_WORKER_URL = "https://mozilla.github.io/pdf.js/build/pdf.worker.mjs";
+const NEW_EVENT_ID = "new";
+const ACTIVITY_TYPE_META: Record<ActivityType, { label: string; icon: string; className: string }> = {
+  multiple_choice: {
+    label: "選擇題",
+    icon: new URL(
+      "../../svgs/format_list_bulleted_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+      import.meta.url
+    ).href,
+    className: "type-multiple-choice"
+  },
+  true_false: {
+    label: "是非題",
+    icon: new URL("../../svgs/rule_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg", import.meta.url)
+      .href,
+    className: "type-true-false"
+  },
+  short_answer: {
+    label: "簡答題",
+    icon: new URL(
+      "../../svgs/tooltip_2_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+      import.meta.url
+    ).href,
+    className: "type-short-answer"
+  },
+  word_cloud: {
+    label: "文字雲",
+    icon: new URL("../../svgs/cloud_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg", import.meta.url)
+      .href,
+    className: "type-word-cloud"
+  }
+};
+const DELETE_ICON_URL = new URL(
+  "../../svgs/delete_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+  import.meta.url
+).href;
+let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
+const pdfDocumentCache = new Map<string, Promise<PdfDocumentProxy>>();
+
+async function loadPdfJs() {
+  if (!pdfJsModulePromise) {
+    pdfJsModulePromise = import(/* @vite-ignore */ PDFJS_MODULE_URL).then((module) => {
+      const pdfJs = module as PdfJsModule;
+      pdfJs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+      return pdfJs;
+    });
+  }
+  return pdfJsModulePromise;
+}
+
+async function loadPdfDocument(url: string) {
+  let promise = pdfDocumentCache.get(url);
+  if (!promise) {
+    promise = loadPdfJs().then((pdfJs) => pdfJs.getDocument({ url }).promise);
+    pdfDocumentCache.set(url, promise);
+  }
+  return promise;
+}
+
+function clearPdfDocumentCacheForEvent(eventId: string) {
+  const filePath = `/api/events/${eventId}/presentation/file`;
+  for (const key of pdfDocumentCache.keys()) {
+    if (key.startsWith(filePath)) {
+      pdfDocumentCache.delete(key);
+    }
+  }
+}
 
 function navigate(path: string) {
   window.history.pushState({}, "", path);
@@ -394,18 +505,10 @@ function DashboardPage() {
 
   async function createNew(event: React.FormEvent) {
     event.preventDefault();
-    if (!token) return;
-    try {
-      const newEvent = await api<EventDetail>("/api/events", {
-        method: "POST",
-        adminToken: token,
-        body: { title, description: "" }
-      });
-      setTitle("");
-      navigate(`/admin/event/${newEvent.id}`);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "建立失敗");
-    }
+    const search = new URLSearchParams();
+    if (title.trim()) search.set("title", title.trim());
+    setTitle("");
+    navigate(`/admin/event/${NEW_EVENT_ID}${search.toString() ? `?${search.toString()}` : ""}`);
   }
 
   async function start(eventId: string) {
@@ -520,6 +623,10 @@ function createDefaultActivityDraft(): ActivityDraft {
     title: "",
     description: "",
     explanation: "",
+    hasDescription: false,
+    hasExplanation: false,
+    hasTimeLimit: false,
+    allowRepeatAnswers: false,
     timeLimitSeconds: 30,
     options: [firstOption, secondOption],
     correctOptionId: "",
@@ -538,17 +645,173 @@ function optionsForType(type: ActivityType, currentOptions: ActivityOption[]) {
   return currentOptions.length ? currentOptions : [draftOption("選項 A"), draftOption("選項 B")];
 }
 
+function presentationPageSize(
+  presentation: EventPresentationRecord | null | undefined,
+  pageNumber: number | null | undefined
+) {
+  const index = Math.max(0, Number(pageNumber ?? 1) - 1);
+  const size = presentation?.pageSizes?.[index];
+  if (size && size.width > 0 && size.height > 0) return size;
+  return { width: 16, height: 9 };
+}
+
+function presentationAspectStyle(
+  presentation: EventPresentationRecord | null | undefined,
+  pageNumber: number | null | undefined
+): React.CSSProperties {
+  const size = presentationPageSize(presentation, pageNumber);
+  return {
+    aspectRatio: `${size.width} / ${size.height}`
+  };
+}
+
+function presentationStageStyle(
+  presentation: EventPresentationRecord | null | undefined,
+  pageNumber: number | null | undefined
+): React.CSSProperties {
+  const size = presentationPageSize(presentation, pageNumber);
+  const ratio = size.width / size.height;
+  return {
+    aspectRatio: `${size.width} / ${size.height}`,
+    maxWidth: `min(100%, calc(68vh * ${ratio}))`
+  };
+}
+
+function wordCloudAllowsRepeat(activity: ActivityRecord) {
+  if (typeof activity.allowRepeatAnswers === "boolean") return activity.allowRepeatAnswers;
+  if (typeof activity.correctAnswer !== "object" || activity.correctAnswer === null) return false;
+  return Boolean((activity.correctAnswer as { allowRepeatAnswers?: unknown }).allowRepeatAnswers);
+}
+
+function PdfCanvasPage({
+  url,
+  pageNumber,
+  className,
+  style
+}: {
+  url: string;
+  pageNumber: number | null | undefined;
+  className: string;
+  style?: React.CSSProperties;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+  const [error, setError] = useState<string | null>(null);
+
+  useLayoutEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      setContainerSize({
+        width: Math.max(0, Math.floor(rect.width)),
+        height: Math.max(0, Math.floor(rect.height))
+      });
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!url || !canvas || containerSize.width <= 0 || containerSize.height <= 0) return;
+
+    const targetCanvas = canvas;
+    let cancelled = false;
+    let renderTask: PdfRenderTask | null = null;
+
+    async function renderPdfPage() {
+      try {
+        setError(null);
+        const pdfDocument = await loadPdfDocument(url);
+        if (cancelled) return;
+
+        const safePageNumber = Math.max(
+          1,
+          Math.min(Math.floor(Number(pageNumber) || 1), pdfDocument.numPages)
+        );
+        const page = await pdfDocument.getPage(safePageNumber);
+        if (cancelled) return;
+
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = Math.min(
+          containerSize.width / baseViewport.width,
+          containerSize.height / baseViewport.height
+        );
+        const viewport = page.getViewport({ scale: Number.isFinite(scale) && scale > 0 ? scale : 1 });
+        const outputScale = window.devicePixelRatio || 1;
+        const context = targetCanvas.getContext("2d");
+        if (!context) throw new Error("Canvas is not available.");
+
+        targetCanvas.width = Math.floor(viewport.width * outputScale);
+        targetCanvas.height = Math.floor(viewport.height * outputScale);
+        targetCanvas.style.width = `${viewport.width}px`;
+        targetCanvas.style.height = `${viewport.height}px`;
+
+        context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+        context.clearRect(0, 0, viewport.width, viewport.height);
+
+        renderTask = page.render({
+          canvasContext: context,
+          viewport
+        });
+        await renderTask.promise;
+      } catch (error) {
+        if (!cancelled) {
+          setError(error instanceof Error ? error.message : "PDF render failed.");
+        }
+      }
+    }
+
+    renderPdfPage();
+
+    return () => {
+      cancelled = true;
+      renderTask?.cancel?.();
+    };
+  }, [containerSize.height, containerSize.width, pageNumber, url]);
+
+  return (
+    <div className={className} ref={containerRef} style={style}>
+      {url ? <canvas ref={canvasRef} /> : <span>PDF</span>}
+      {error ? <small className="pdf-render-error">PDF 載入失敗</small> : null}
+    </div>
+  );
+}
+
 function EventEditorPage({ eventId }: { eventId: string }) {
   const token = getAdminToken();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [draft, setDraft] = useState<ActivityDraft>(() => createDefaultActivityDraft());
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [insertAfterTimelineItemId, setInsertAfterTimelineItemId] = useState<string | null>(null);
+  const [activityEditorOpen, setActivityEditorOpen] = useState(false);
+  const [savedEventSettings, setSavedEventSettings] = useState<{
+    title: string;
+    description: string;
+  } | null>(null);
+  const [temporaryEventId, setTemporaryEventId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reordering, setReordering] = useState(false);
+  const [uploadingPresentation, setUploadingPresentation] = useState(false);
+  const [draggingTimelineItemId, setDraggingTimelineItemId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{
+    itemId: string;
+    position: "before" | "after";
+  } | null>(null);
+  const isNewEvent = eventId === NEW_EVENT_ID;
 
   const activityListRef = useRef<HTMLElement | null>(null);
   const activityListFlipRef = useRef<Map<string, DOMRect> | null>(null);
   const activityListFlipPendingRef = useRef(false);
+  const creatingEventPromiseRef = useRef<Promise<EventDetail | null> | null>(null);
+  const timelineDragOriginRef = useRef<EventDetail | null>(null);
+  const timelineDropCommittedRef = useRef(false);
 
   const recordActivityListFlip = useCallback(() => {
     const container = activityListRef.current;
@@ -600,28 +863,125 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       );
       animation.onfinish = () => animation.cancel();
     }
-  }, [event?.activities]);
+  }, [event?.timeline]);
 
-  const load = useCallback(async () => {
+  const presentationFileUrl = useMemo(() => {
+    if (!event?.presentation || !token || event.id === NEW_EVENT_ID) return "";
+    const tokenParam = encodeURIComponent(token);
+    const versionParam = encodeURIComponent(`${event.presentation.id}-${event.presentation.updatedAt}`);
+    return `/api/events/${event.id}/presentation/file?token=${tokenParam}&v=${versionParam}`;
+  }, [event?.id, event?.presentation, token]);
+
+  const load = useCallback(async (preserveCurrentSettings = false, overrideEventId?: string) => {
     if (!token) return;
     try {
-      setEvent(await api<EventDetail>(`/api/events/${eventId}`, { adminToken: token }));
+      const targetEventId = overrideEventId ?? temporaryEventId ?? (isNewEvent ? null : eventId);
+      if (!targetEventId) {
+        const title = new URLSearchParams(window.location.search).get("title") ?? "";
+        setEvent({
+          id: NEW_EVENT_ID,
+          title,
+          description: "",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          activities: [],
+          presentation: null,
+          timeline: []
+        });
+        setSavedEventSettings({
+          title: "",
+          description: ""
+        });
+        return;
+      }
+
+      const loaded = await api<EventDetail>(`/api/events/${targetEventId}`, { adminToken: token });
+      setEvent((current) =>
+        preserveCurrentSettings && current
+          ? {
+              ...loaded,
+              title: current.title,
+              description: current.description
+            }
+          : loaded
+      );
+      if (!preserveCurrentSettings) {
+        setSavedEventSettings({
+          title: loaded.title,
+          description: loaded.description
+        });
+      }
     } catch (error) {
       setError(error instanceof Error ? error.message : "讀取活動失敗");
     }
-  }, [eventId, token]);
+  }, [eventId, isNewEvent, temporaryEventId, token]);
 
   useEffect(() => {
     load();
   }, [load]);
 
+  useEffect(() => {
+    if (!activityEditorOpen) return;
+    const closeOnEscape = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") closeActivityEditor();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityEditorOpen]);
+
+  async function ensureEventRecord() {
+    if (!token || !event) return null;
+    if (event.id !== NEW_EVENT_ID) return event;
+    if (creatingEventPromiseRef.current) return creatingEventPromiseRef.current;
+
+    creatingEventPromiseRef.current = api<EventDetail>("/api/events", {
+      method: "POST",
+      adminToken: token,
+      body: {
+        title: event.title,
+        description: event.description
+      }
+    })
+      .then((created) => {
+        setEvent(created);
+        setTemporaryEventId(created.id);
+        return created;
+      })
+      .catch((error) => {
+        setError(error instanceof Error ? error.message : "建立暫存活動失敗");
+        return null;
+      })
+      .finally(() => {
+        creatingEventPromiseRef.current = null;
+      });
+
+    return creatingEventPromiseRef.current;
+  }
+
+  async function openNewActivity() {
+    const activeEvent = await ensureEventRecord();
+    if (!activeEvent) return;
+
+    setEditingId(null);
+    setInsertAfterTimelineItemId(null);
+    setDraft(createDefaultActivityDraft());
+    setActivityEditorOpen(true);
+  }
+
   function editActivity(activity: ActivityRecord) {
     setEditingId(activity.id);
+    setInsertAfterTimelineItemId(null);
+    setActivityEditorOpen(true);
     setDraft({
       type: activity.type,
       title: activity.title,
       description: activity.description,
       explanation: activity.explanation,
+      hasDescription: Boolean(activity.description),
+      hasExplanation: Boolean(activity.explanation),
+      hasTimeLimit: activity.timeLimitSeconds > 0,
+      allowRepeatAnswers: activity.type === "word_cloud" ? wordCloudAllowsRepeat(activity) : false,
       timeLimitSeconds: activity.timeLimitSeconds,
       options: activity.options,
       correctOptionId: correctOptionId(activity.correctAnswer),
@@ -633,20 +993,23 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     return {
       type: draft.type,
       title: draft.title,
-      description: draft.description,
-      explanation: draft.explanation,
-      timeLimitSeconds: draft.timeLimitSeconds,
+      description: draft.hasDescription ? draft.description : "",
+      explanation: draft.hasExplanation ? draft.explanation : "",
+      timeLimitSeconds: draft.hasTimeLimit ? draft.timeLimitSeconds : 0,
       options: draft.options
         .map((option) => ({ ...option, label: option.label.trim() }))
         .filter((option) => option.label),
       correctAnswer:
-        draft.type === "short_answer"
-          ? draft.correctText.trim()
-            ? { text: draft.correctText.trim() }
-            : null
-          : draft.correctOptionId
-            ? { optionId: draft.correctOptionId }
-            : null
+        draft.type === "word_cloud"
+          ? { allowRepeatAnswers: draft.allowRepeatAnswers }
+          : draft.type === "short_answer"
+            ? draft.correctText.trim()
+              ? { text: draft.correctText.trim() }
+              : null
+            : draft.correctOptionId
+              ? { optionId: draft.correctOptionId }
+              : null,
+      insertAfterTimelineItemId: editingId ? null : insertAfterTimelineItemId
     };
   }
 
@@ -654,24 +1017,64 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     eventForm.preventDefault();
     if (!token || !event) return;
     try {
-      const updated = await api<EventDetail>(`/api/events/${event.id}`, {
-        method: "PUT",
-        adminToken: token,
-        body: {
-          title: event.title,
-          description: event.description
-        }
-      });
+      const updated = event.id === NEW_EVENT_ID
+        ? await api<EventDetail>("/api/events", {
+            method: "POST",
+            adminToken: token,
+            body: {
+              title: event.title,
+              description: event.description
+            }
+          })
+        : await api<EventDetail>(`/api/events/${event.id}`, {
+            method: "PUT",
+            adminToken: token,
+            body: {
+              title: event.title,
+              description: event.description
+            }
+          });
       setEvent(updated);
+      setSavedEventSettings({
+        title: updated.title,
+        description: updated.description
+      });
+      setTemporaryEventId(null);
       navigate("/admin/dashboard");
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to save event.");
     }
   }
 
+  function eventSettingsChanged() {
+    if (!event || !savedEventSettings) return false;
+    return (
+      event.title !== savedEventSettings.title ||
+      event.description !== savedEventSettings.description
+    );
+  }
+
+  async function backToDashboard() {
+    const hasTemporaryEvent = isNewEvent && event?.id !== NEW_EVENT_ID;
+    if ((eventSettingsChanged() || hasTemporaryEvent) && !confirm("活動尚未儲存。確定不儲存並回列表嗎？")) {
+      return;
+    }
+    if (hasTemporaryEvent && token && event) {
+      try {
+        await api(`/api/events/${event.id}`, { method: "DELETE", adminToken: token });
+      } catch (error) {
+        setError(error instanceof Error ? error.message : "刪除暫存活動失敗");
+        return;
+      }
+    }
+    navigate("/admin/dashboard");
+  }
+
   async function saveActivity(activityForm: React.FormEvent) {
     activityForm.preventDefault();
     if (!token || !event) return;
+    const activeEvent = await ensureEventRecord();
+    if (!activeEvent) return;
     try {
       if (editingId) {
         await api(`/api/activities/${editingId}`, {
@@ -680,7 +1083,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           body: payloadFromDraft()
         });
       } else {
-        await api(`/api/events/${event.id}/activities`, {
+        await api(`/api/events/${activeEvent.id}/activities`, {
           method: "POST",
           adminToken: token,
           body: payloadFromDraft()
@@ -689,7 +1092,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       setError(null);
       setDraft(createDefaultActivityDraft());
       setEditingId(null);
-      await load();
+      setInsertAfterTimelineItemId(null);
+      setActivityEditorOpen(false);
+      await load(true, activeEvent.id);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "儲存題目失敗");
     }
@@ -698,34 +1103,199 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   async function removeActivity(activityId: string) {
     if (!token || !confirm("刪除此題？")) return;
     await api(`/api/activities/${activityId}`, { method: "DELETE", adminToken: token });
-    await load();
+    await load(true);
   }
 
-  async function moveActivity(activityId: string, direction: -1 | 1) {
-    if (!token || !event || reordering) return;
-    const activities = [...event.activities];
-    const index = activities.findIndex((activity) => activity.id === activityId);
-    const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= activities.length) return;
-    [activities[index], activities[nextIndex]] = [activities[nextIndex], activities[index]];
+  async function uploadPresentation(file: File | null) {
+    if (!token || !event || !file) return;
+    const activeEvent = await ensureEventRecord();
+    if (!activeEvent) return;
+    setUploadingPresentation(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch(`/api/events/${activeEvent.id}/presentation`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`
+        },
+        body: form
+      });
+      const updated = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(updated.error ?? "上傳 PDF 失敗");
+      }
+      clearPdfDocumentCacheForEvent(activeEvent.id);
+      setEvent((current) =>
+        current
+          ? {
+              ...(updated as EventDetail),
+              title: current.title,
+              description: current.description
+            }
+          : (updated as EventDetail)
+      );
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "上傳 PDF 失敗");
+    } finally {
+      setUploadingPresentation(false);
+    }
+  }
 
-    recordActivityListFlip();
-    setEvent({ ...event, activities });
+  async function removePresentation() {
+    if (!token || !event?.presentation || uploadingPresentation) return;
+    if (!confirm("移除已匯入的 PDF？相關簡報頁也會從流程中移除。")) return;
 
+    setUploadingPresentation(true);
+    setError(null);
+    try {
+      const updated = await api<EventDetail>(`/api/events/${event.id}/presentation`, {
+        method: "DELETE",
+        adminToken: token
+      });
+      clearPdfDocumentCacheForEvent(event.id);
+      setEvent((current) =>
+        current
+          ? {
+              ...updated,
+              title: current.title,
+              description: current.description
+            }
+          : updated
+      );
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "移除 PDF 失敗");
+    } finally {
+      setUploadingPresentation(false);
+    }
+  }
+
+  async function persistTimelineOrder(nextTimeline: TimelineItemRecord[], previousEvent: EventDetail) {
+    if (!token) return;
     setReordering(true);
     try {
-      const reordered = await api<ActivityRecord[]>(`/api/events/${event.id}/activities/reorder`, {
+      const reordered = await api<TimelineItemRecord[]>(`/api/events/${previousEvent.id}/timeline/reorder`, {
         method: "PUT",
         adminToken: token,
-        body: { activityIds: activities.map((activity) => activity.id) }
+        body: { timelineItemIds: nextTimeline.map((item) => item.id) }
       });
-      setEvent((current) => (current ? { ...current, activities: reordered } : current));
+      setEvent((current) => (current ? { ...current, timeline: reordered } : current));
     } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to reorder activity.");
-      setEvent(event);
+      setError(error instanceof Error ? error.message : "Failed to reorder timeline.");
+      setEvent(previousEvent);
     } finally {
       setReordering(false);
     }
+  }
+
+  function previewTimelineMove(targetItem: TimelineItemRecord, position: "before" | "after") {
+    if (!draggingTimelineItemId) return;
+
+    setEvent((current) => {
+      if (!current) return current;
+
+      const draggedItem = current.timeline.find((item) => item.id === draggingTimelineItemId);
+      if (!draggedItem || draggedItem.type !== "activity" || draggedItem.id === targetItem.id) {
+        return current;
+      }
+
+      const timelineWithoutDragged = current.timeline.filter((item) => item.id !== draggedItem.id);
+      const targetIndex = timelineWithoutDragged.findIndex((item) => item.id === targetItem.id);
+      if (targetIndex === -1) return current;
+
+      const insertIndex = position === "before" ? targetIndex : targetIndex + 1;
+      const nextTimeline = [...timelineWithoutDragged];
+      nextTimeline.splice(insertIndex, 0, draggedItem);
+
+      if (
+        nextTimeline.map((item) => item.id).join("|") ===
+        current.timeline.map((item) => item.id).join("|")
+      ) {
+        return current;
+      }
+
+      recordActivityListFlip();
+      return { ...current, timeline: nextTimeline };
+    });
+  }
+
+  function handleTimelineDragOver(dragEvent: React.DragEvent<HTMLElement>, item: TimelineItemRecord) {
+    if (!draggingTimelineItemId || draggingTimelineItemId === item.id) return;
+    dragEvent.preventDefault();
+    dragEvent.dataTransfer.dropEffect = "move";
+
+    const rect = dragEvent.currentTarget.getBoundingClientRect();
+    const position = dragEvent.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    setDropTarget({ itemId: item.id, position });
+    previewTimelineMove(item, position);
+  }
+
+  function startTimelineDrag(dragEvent: React.DragEvent<HTMLElement>, item: TimelineItemRecord) {
+    if (!event || item.type !== "activity" || reordering) {
+      dragEvent.preventDefault();
+      return;
+    }
+
+    const rect = dragEvent.currentTarget.getBoundingClientRect();
+    dragEvent.dataTransfer.effectAllowed = "move";
+    dragEvent.dataTransfer.setData("text/plain", item.id);
+    dragEvent.dataTransfer.setDragImage(
+      dragEvent.currentTarget,
+      dragEvent.clientX - rect.left,
+      dragEvent.clientY - rect.top
+    );
+    timelineDragOriginRef.current = event;
+    timelineDropCommittedRef.current = false;
+    setDraggingTimelineItemId(item.id);
+  }
+
+  function finishTimelineDrag() {
+    if (!timelineDropCommittedRef.current && timelineDragOriginRef.current) {
+      setEvent(timelineDragOriginRef.current);
+    }
+    timelineDragOriginRef.current = null;
+    timelineDropCommittedRef.current = false;
+    setDraggingTimelineItemId(null);
+    setDropTarget(null);
+  }
+
+  async function dropTimelineItem(dropEvent: React.DragEvent<HTMLElement>) {
+    dropEvent.preventDefault();
+    if (!event || reordering || !draggingTimelineItemId) return;
+
+    const previousEvent = timelineDragOriginRef.current ?? event;
+    const nextTimeline = event.timeline;
+    const orderChanged =
+      nextTimeline.map((item) => item.id).join("|") !==
+      previousEvent.timeline.map((item) => item.id).join("|");
+
+    timelineDropCommittedRef.current = true;
+    setDraggingTimelineItemId(null);
+    setDropTarget(null);
+
+    if (orderChanged) {
+      await persistTimelineOrder(nextTimeline, previousEvent);
+    }
+
+    timelineDragOriginRef.current = null;
+  }
+
+  async function prepareInsertAfter(item: TimelineItemRecord) {
+    const activeEvent = await ensureEventRecord();
+    if (!activeEvent) return;
+
+    setEditingId(null);
+    setInsertAfterTimelineItemId(item.id);
+    setDraft(createDefaultActivityDraft());
+    setActivityEditorOpen(true);
+  }
+
+  function closeActivityEditor() {
+    setActivityEditorOpen(false);
+    setEditingId(null);
+    setInsertAfterTimelineItemId(null);
+    setDraft(createDefaultActivityDraft());
   }
 
   if (!event) {
@@ -744,236 +1314,515 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       <main className="page">
         <Header
           title="活動編輯"
-          actions={<button onClick={() => navigate("/admin/dashboard")}>回列表</button>}
+          actions={
+            <>
+              <button className="secondary" onClick={backToDashboard}>
+                回列表
+              </button>
+              <button form="event-settings-form">儲存活動</button>
+            </>
+          }
         />
         <ErrorBanner message={error} />
-        <div className="two-column">
-          <section className="panel form-stack">
-            <form className="form-stack" onSubmit={saveEvent}>
-              <label>
-                活動標題
-                <input
-                  value={event.title}
-                  onChange={(change) => setEvent({ ...event, title: change.target.value })}
-                />
-              </label>
-              <label>
-                活動描述
-                <textarea
-                  value={event.description}
-                  onChange={(change) => setEvent({ ...event, description: change.target.value })}
-                />
-              </label>
-              <button>儲存活動</button>
-            </form>
-          </section>
-
-          <section className="panel form-stack">
-            <h2>{editingId ? "編輯題目" : "新增題目"}</h2>
-            <form className="form-stack" onSubmit={saveActivity}>
-              <label>
-                題型
-                <select
-                  value={draft.type}
-                  onChange={(change) => {
-                    const nextType = change.target.value as ActivityType;
-                    const nextOptions = optionsForType(nextType, draft.options);
-                    setDraft({
-                      ...draft,
-                      type: nextType,
-                      options: nextOptions,
-                      correctOptionId: nextOptions.some(
-                        (option) => option.id === draft.correctOptionId
-                      )
-                        ? draft.correctOptionId
-                        : ""
-                    });
-                  }}
+        <div className="event-editor-layout">
+        <aside className="panel event-settings-panel">
+          <form id="event-settings-form" className="event-fields" onSubmit={saveEvent}>
+            <label>
+              標題
+              <input
+                value={event.title}
+                onChange={(change) => setEvent({ ...event, title: change.target.value })}
+              />
+            </label>
+            <label>
+              描述
+              <textarea
+                value={event.description}
+                onChange={(change) => setEvent({ ...event, description: change.target.value })}
+              />
+            </label>
+          </form>
+          <div className="event-editor-toolbar">
+            <div className="button-row">
+              {event.presentation ? (
+                <button
+                  className="file-import-button presentation-delete-button"
+                  type="button"
+                  disabled={uploadingPresentation}
+                  onClick={removePresentation}
                 >
-                  <option value="multiple_choice">選擇題</option>
-                  <option value="true_false">是非題</option>
-                  <option value="short_answer">簡答題</option>
-                  <option value="word_cloud">文字雲</option>
-                </select>
-              </label>
-              <label>
-                題目
-                <input
-                  value={draft.title}
-                  onChange={(change) => setDraft({ ...draft, title: change.target.value })}
-                />
-              </label>
-              <label>
-                補充說明
-                <textarea
-                  value={draft.description}
-                  onChange={(change) => setDraft({ ...draft, description: change.target.value })}
-                />
-              </label>
-              <label>
-                詳解
-                <textarea
-                  value={draft.explanation}
-                  onChange={(change) => setDraft({ ...draft, explanation: change.target.value })}
-                  placeholder="時間到後向參與者顯示的解析"
-                />
-              </label>
-              <label>
-                作答秒數（0 表示不限時）
-                <input
-                  type="number"
-                  min={0}
-                  max={3600}
-                  value={draft.timeLimitSeconds}
-                  onChange={(change) =>
-                    setDraft({
-                      ...draft,
-                      timeLimitSeconds: Math.max(0, Math.min(3600, Number(change.target.value) || 0))
-                    })
-                  }
-                />
-              </label>
-              {draft.type === "multiple_choice" || draft.type === "true_false" ? (
-                <div className="form-stack">
-                  <span className="field-label">選項與正確答案</span>
-                  <div className="option-editor">
-                    {draft.options.map((option, index) => (
-                      <div className="option-edit-row" key={option.id}>
-                        <input
-                          type="radio"
-                          name="correct-answer"
-                          checked={draft.correctOptionId === option.id}
-                          onChange={() => setDraft({ ...draft, correctOptionId: option.id })}
-                          title="設為正確答案"
-                        />
-                        <input
-                          value={option.label}
-                          disabled={draft.type === "true_false"}
-                          onChange={(change) => {
-                            const nextOptions = draft.options.map((candidate) =>
-                              candidate.id === option.id
-                                ? { ...candidate, label: change.target.value }
-                                : candidate
-                            );
-                            setDraft({ ...draft, options: nextOptions });
-                          }}
-                          placeholder={`選項 ${index + 1}`}
-                        />
-                        {draft.type === "multiple_choice" ? (
-                          <button
-                            className="secondary"
-                            type="button"
-                            disabled={draft.options.length <= 2}
-                            onClick={() => {
-                              const nextOptions = draft.options.filter(
-                                (candidate) => candidate.id !== option.id
-                              );
-                              setDraft({
-                                ...draft,
-                                options: nextOptions,
-                                correctOptionId:
-                                  draft.correctOptionId === option.id ? "" : draft.correctOptionId
-                              });
-                            }}
-                          >
-                            移除
-                          </button>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                  {draft.type === "multiple_choice" ? (
-                    <button
-                      className="secondary"
-                      type="button"
-                      disabled={draft.options.length >= 6}
-                      onClick={() =>
-                        setDraft({
-                          ...draft,
-                          options: [...draft.options, draftOption(`選項 ${draft.options.length + 1}`)]
-                        })
-                      }
-                    >
-                      新增選項
-                    </button>
-                  ) : null}
-                </div>
-              ) : null}
-              {draft.type === "short_answer" ? (
-                <label>
-                  正確答案（需與作答完全相同）
+                  <img src={DELETE_ICON_URL} alt="" aria-hidden="true" />
+                  刪除 PDF
+                </button>
+              ) : (
+                <label className="file-import-button" aria-disabled={uploadingPresentation}>
+                  <span aria-hidden="true">+</span>
+                  匯入 PDF
                   <input
-                    value={draft.correctText}
-                    onChange={(change) => setDraft({ ...draft, correctText: change.target.value })}
-                    placeholder="輸入標準答案"
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    disabled={uploadingPresentation}
+                    onChange={(change) => {
+                      uploadPresentation(change.target.files?.[0] ?? null);
+                      change.target.value = "";
+                    }}
                   />
                 </label>
-              ) : null}
-              <div className="button-row">
-                <button>{editingId ? "更新題目" : "新增題目"}</button>
-                {editingId ? (
-                  <button
-                    className="secondary"
-                    type="button"
-                    onClick={() => {
-                      setEditingId(null);
-                      setDraft(createDefaultActivityDraft());
-                    }}
-                  >
-                    取消
-                  </button>
-                ) : null}
-              </div>
-            </form>
-          </section>
-        </div>
+              )}
+            </div>
+            <div className="presentation-status">
+              {event.presentation ? (
+                <p className="muted">
+                  已載入：{event.presentation.originalName}（{event.presentation.pageCount} 頁）
+                </p>
+              ) : (
+                <p className="muted">尚未上傳簡報。可直接匯入 PDF，未儲存離開時不會保留。</p>
+              )}
+              {uploadingPresentation ? <p className="muted">PDF 上傳中...</p> : null}
+            </div>
+          </div>
+        </aside>
 
-        <section className="activity-list" ref={activityListRef}>
-          {event.activities.map((activity, index) => (
-            <article className="item-card" key={activity.id} data-flip-id={activity.id}>
-              <div>
-                <small>
-                  #{index + 1} {activity.type}
-                  {activity.timeLimitSeconds > 0 ? ` · ${activity.timeLimitSeconds} 秒` : " · 不限時"}
-                </small>
-                <h2>{activity.title}</h2>
-                <p>{activity.description}</p>
-                {activity.explanation ? <p className="muted">詳解：{activity.explanation}</p> : null}
-                {activity.type === "short_answer" && correctAnswerText(activity.correctAnswer) ? (
-                  <p className="muted">正解：{correctAnswerText(activity.correctAnswer)}</p>
-                ) : null}
-                {activity.options.length ? (
-                  <div className="option-pills">
-                    {activity.options.map((option) => (
-                      <span key={option.id}>
-                        {option.label}
-                        {correctOptionId(activity.correctAnswer) === option.id ? " (正解)" : ""}
+        {activityEditorOpen ? (
+          <div
+            className="modal-layer"
+            role="presentation"
+            onMouseDown={(mouseEvent) => {
+              if (mouseEvent.target === mouseEvent.currentTarget) closeActivityEditor();
+            }}
+          >
+            <section
+              className="activity-editor-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="activity-editor-title"
+              onMouseDown={(mouseEvent) => mouseEvent.stopPropagation()}
+            >
+              <div className="activity-editor-header">
+                <div>
+                  <h2 id="activity-editor-title">
+                    {editingId
+                      ? "編輯題目"
+                      : insertAfterTimelineItemId
+                        ? "插入題目"
+                        : "新增題目"}
+                  </h2>
+                </div>
+                <button
+                  className="icon-button close-button"
+                  type="button"
+                  aria-label="關閉題目編輯"
+                  title="關閉"
+                  onClick={closeActivityEditor}
+                >
+                  ×
+                </button>
+              </div>
+              <form className="activity-editor-form" onSubmit={saveActivity}>
+                <label className="question-primary-field">
+                  題目
+                  <textarea
+                    className="question-title-input"
+                    value={draft.title}
+                    onChange={(change) => setDraft({ ...draft, title: change.target.value })}
+                  />
+                </label>
+
+                <div className="activity-control-strip">
+                  <div className="activity-control-left">
+                    <label className="activity-type-field">
+                      題型
+                      <select
+                        value={draft.type}
+                        onChange={(change) => {
+                          const nextType = change.target.value as ActivityType;
+                          const nextOptions = optionsForType(nextType, draft.options);
+                          setDraft({
+                            ...draft,
+                            type: nextType,
+                            options: nextOptions,
+                            correctOptionId: nextOptions.some(
+                              (option) => option.id === draft.correctOptionId
+                            )
+                              ? draft.correctOptionId
+                              : ""
+                          });
+                        }}
+                      >
+                        <option value="multiple_choice">選擇題</option>
+                        <option value="true_false">是非題</option>
+                        <option value="short_answer">簡答題</option>
+                        <option value="word_cloud">文字雲</option>
+                      </select>
+                    </label>
+
+                    <div className="time-setting-group">
+                      <span className="field-label">設定時間</span>
+                      <div className="time-setting-controls">
+                        <label className="toggle-row compact-toggle">
+                          <span>
+                            <strong>限時</strong>
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={draft.hasTimeLimit}
+                            onChange={(change) =>
+                              setDraft({
+                                ...draft,
+                                hasTimeLimit: change.target.checked,
+                                timeLimitSeconds:
+                                  change.target.checked && draft.timeLimitSeconds <= 0
+                                    ? 30
+                                    : draft.timeLimitSeconds
+                              })
+                            }
+                          />
+                        </label>
+                        <label
+                          className={[
+                            "inline-number-field",
+                            "time-seconds-field",
+                            draft.hasTimeLimit ? "" : "disabled"
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                        >
+                          <span className="seconds-input-shell">
+                            <input
+                              type="number"
+                              min={1}
+                              max={3600}
+                              disabled={!draft.hasTimeLimit}
+                              value={draft.timeLimitSeconds || 30}
+                              onChange={(change) =>
+                                setDraft({
+                                  ...draft,
+                                  timeLimitSeconds: Math.max(
+                                    1,
+                                    Math.min(3600, Number(change.target.value) || 30)
+                                  )
+                                })
+                              }
+                            />
+                            <span className="seconds-suffix">秒</span>
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="activity-control-right">
+                    <label className="toggle-row compact-toggle">
+                      <span>
+                        <strong>補充說明</strong>
                       </span>
-                    ))}
+                      <input
+                        type="checkbox"
+                        checked={draft.hasDescription}
+                        onChange={(change) =>
+                          setDraft({
+                            ...draft,
+                            hasDescription: change.target.checked,
+                            description: change.target.checked ? draft.description : ""
+                          })
+                        }
+                      />
+                    </label>
+
+                    <label className="toggle-row compact-toggle">
+                      <span>
+                        <strong>提供詳解</strong>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={draft.hasExplanation}
+                        onChange={(change) =>
+                          setDraft({
+                            ...draft,
+                            hasExplanation: change.target.checked,
+                            explanation: change.target.checked ? draft.explanation : ""
+                          })
+                        }
+                      />
+                    </label>
+
+                    {draft.type === "word_cloud" ? (
+                      <label className="toggle-row compact-toggle">
+                        <span>
+                          <strong>允許重複填答</strong>
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={draft.allowRepeatAnswers}
+                          onChange={(change) =>
+                            setDraft({ ...draft, allowRepeatAnswers: change.target.checked })
+                          }
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                </div>
+
+                {draft.hasDescription ? (
+                  <textarea
+                    className="expanded-field"
+                    aria-label="補充說明"
+                    value={draft.description}
+                    onChange={(change) => setDraft({ ...draft, description: change.target.value })}
+                    placeholder="輸入題目補充說明"
+                  />
+                ) : null}
+
+                {draft.hasExplanation ? (
+                  <textarea
+                    className="expanded-field"
+                    aria-label="詳解"
+                    value={draft.explanation}
+                    onChange={(change) => setDraft({ ...draft, explanation: change.target.value })}
+                    placeholder="時間到後向參與者顯示的解析"
+                  />
+                ) : null}
+
+                {draft.type === "multiple_choice" || draft.type === "true_false" ? (
+                  <div className="form-stack option-editor-card">
+                    <span className="field-label">選項與正確答案</span>
+                    <div className="option-editor">
+                      {draft.options.map((option, index) => (
+                        <div className="option-edit-row" key={option.id}>
+                          <input
+                            type="radio"
+                            name="correct-answer"
+                            checked={draft.correctOptionId === option.id}
+                            onChange={() => setDraft({ ...draft, correctOptionId: option.id })}
+                            title="設為正確答案"
+                          />
+                          <input
+                            value={option.label}
+                            disabled={draft.type === "true_false"}
+                            onChange={(change) => {
+                              const nextOptions = draft.options.map((candidate) =>
+                                candidate.id === option.id
+                                  ? { ...candidate, label: change.target.value }
+                                  : candidate
+                              );
+                              setDraft({ ...draft, options: nextOptions });
+                            }}
+                            placeholder={`選項 ${index + 1}`}
+                          />
+                          {draft.type === "multiple_choice" ? (
+                            <button
+                              className="icon-button secondary"
+                              type="button"
+                              disabled={draft.options.length <= 2}
+                              aria-label={`移除選項 ${index + 1}`}
+                              title="移除選項"
+                              onClick={() => {
+                                const nextOptions = draft.options.filter(
+                                  (candidate) => candidate.id !== option.id
+                                );
+                                setDraft({
+                                  ...draft,
+                                  options: nextOptions,
+                                  correctOptionId:
+                                    draft.correctOptionId === option.id
+                                      ? ""
+                                      : draft.correctOptionId
+                                });
+                              }}
+                            >
+                              ×
+                            </button>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                    {draft.type === "multiple_choice" ? (
+                      <button
+                        className="secondary icon-text-button"
+                        type="button"
+                        disabled={draft.options.length >= 6}
+                        onClick={() =>
+                          setDraft({
+                            ...draft,
+                            options: [
+                              ...draft.options,
+                              draftOption(`選項 ${draft.options.length + 1}`)
+                            ]
+                          })
+                        }
+                      >
+                        <span aria-hidden="true">+</span>
+                        選項
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
+                {draft.type === "short_answer" ? (
+                  <label>
+                    正確答案（需與作答完全相同）
+                    <input
+                      value={draft.correctText}
+                      onChange={(change) => setDraft({ ...draft, correctText: change.target.value })}
+                      placeholder="輸入標準答案"
+                    />
+                  </label>
+                ) : null}
+                <div className="modal-actions">
+                  <button>{editingId ? "更新題目" : "新增題目"}</button>
+                  <button className="secondary" type="button" onClick={closeActivityEditor}>
+                    取消
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        ) : null}
+
+        <section className="event-timeline-column">
+        <section className="timeline-list" ref={activityListRef}>
+          <div className="timeline-heading">
+            <h2>簡報流程</h2>
+            <p className="muted">
+              PDF 頁與題目會照這個順序播放。參與者只會在題目頁開始作答時看到題目。
+            </p>
+          </div>
+          <div className="timeline-items-scroll">
+            {event.timeline.length === 0 ? (
+              <div className="empty-timeline-insert">
+                <p className="muted">尚未新增簡報頁或題目。</p>
+                <button className="icon-text-button" type="button" onClick={openNewActivity}>
+                  <span aria-hidden="true">+</span>
+                  新增第一題
+                </button>
               </div>
-              <div className="button-row">
-                <button
-                  disabled={reordering || index === 0}
-                  onClick={() => moveActivity(activity.id, -1)}
+            ) : null}
+            {event.timeline.map((item, index) => {
+              const activity = item.activity ?? event.activities.find((candidate) => candidate.id === item.activityId);
+              const isPdfPage = item.type === "pdf_page";
+              const isDropTarget = dropTarget?.itemId === item.id;
+              const activityMeta = activity ? ACTIVITY_TYPE_META[activity.type] : null;
+              const activityNumber = event.timeline
+                .slice(0, index + 1)
+                .filter((candidate) => candidate.type === "activity").length;
+              return (
+                <Fragment key={item.id}>
+                <article
+                  className={[
+                    "item-card",
+                    "timeline-card",
+                    isPdfPage ? "pdf-card" : "activity-card",
+                    draggingTimelineItemId === item.id ? "dragging" : "",
+                    isDropTarget ? `drop-${dropTarget.position}` : ""
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  data-flip-id={item.id}
+                  draggable={Boolean(activity) && !reordering}
+                  onDragStart={(dragEvent) => startTimelineDrag(dragEvent, item)}
+                  onDragEnd={finishTimelineDrag}
+                  onDragOver={(dragEvent) => handleTimelineDragOver(dragEvent, item)}
+                  onDrop={dropTimelineItem}
+                  onDragLeave={(dragEvent) => {
+                    const relatedTarget = dragEvent.relatedTarget;
+                    if (
+                      relatedTarget instanceof Node &&
+                      dragEvent.currentTarget.contains(relatedTarget)
+                    ) {
+                      return;
+                    }
+                    setDropTarget((current) => (current?.itemId === item.id ? null : current));
+                  }}
                 >
-                  上移
-                </button>
-                <button
-                  disabled={reordering || index === event.activities.length - 1}
-                  onClick={() => moveActivity(activity.id, 1)}
+                  <div className="timeline-card-body">
+                    {isPdfPage ? (
+                      <>
+                        <PdfCanvasPage
+                          className="pdf-page-preview"
+                          url={presentationFileUrl}
+                          pageNumber={item.pageNumber}
+                          style={presentationAspectStyle(event.presentation, item.pageNumber)}
+                        />
+                        <div>
+                          <h3>簡報 Page {item.pageNumber}</h3>
+                        </div>
+                      </>
+                    ) : activity ? (
+                      <>
+                        <div
+                          className={[
+                            "activity-type-icon",
+                            activityMeta?.className ?? ""
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          aria-hidden="true"
+                        >
+                          {activityMeta ? <img src={activityMeta.icon} alt="" /> : null}
+                        </div>
+                        <div>
+                          <small>
+                            第 {activityNumber} 題 · {activityMeta?.label ?? "題目"}
+                            {activity.timeLimitSeconds > 0 ? ` · ${activity.timeLimitSeconds} 秒` : " · 不限時"}
+                          </small>
+                          <h2>{activity.title}</h2>
+                        </div>
+                      </>
+                    ) : (
+                      <div>
+                        <small>題目</small>
+                        <h2>題目不存在</h2>
+                        <p>這個時間軸項目連到已刪除的題目。</p>
+                      </div>
+                    )}
+                  </div>
+                  <div className="button-row timeline-actions">
+                    {activity ? (
+                      <>
+                        <button
+                          className="icon-button"
+                          aria-label="編輯題目"
+                          title="編輯題目"
+                          onClick={() => editActivity(activity)}
+                        >
+                          ✎
+                        </button>
+                        <button
+                          className="icon-button danger"
+                          aria-label="刪除題目"
+                          title="刪除題目"
+                          onClick={() => removeActivity(activity.id)}
+                        >
+                          ×
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                </article>
+                <div
+                  className={[
+                    "timeline-insert-slot",
+                    index === event.timeline.length - 1 ? "final" : ""
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
                 >
-                  下移
-                </button>
-                <button onClick={() => editActivity(activity)}>編輯</button>
-                <button className="danger" onClick={() => removeActivity(activity.id)}>
-                  刪除
-                </button>
-              </div>
-            </article>
-          ))}
+                  <button
+                    className="timeline-insert-button"
+                    type="button"
+                    aria-label="在此處新增題目"
+                    title="在此處新增題目"
+                    onClick={() => prepareInsertAfter(item)}
+                  >
+                    +
+                  </button>
+                </div>
+                </Fragment>
+              );
+            })}
+          </div>
         </section>
+        </section>
+        </div>
       </main>
     </AdminGuard>
   );
@@ -1234,7 +2083,7 @@ function layoutWordCloud(words: WordCloudWord[]) {
 
 function WordCloudView({ words }: { words: WordCloudWord[] }) {
   const placedWords = useMemo(() => layoutWordCloud(words), [words]);
-  const colors = ["#176b87", "#1b7f55", "#b45f06", "#7a3e9d", "#9f2d55", "#3856a6"];
+  const colors = ["#4b2f8f", "#237355", "#8a631f", "#335f9f", "#9d4d66", "#6f5aa7"];
 
   return (
     <svg className="word-cloud" viewBox="0 0 800 420" role="img" aria-label="文字雲結果">
@@ -1426,10 +2275,17 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   });
 
   const remaining = useServerCountdown(state);
-  const activities = state?.activities ?? [];
-  const currentIndex = activities.findIndex((activity) => activity.id === state?.currentActivity?.id);
-  const previousActivity = activities[currentIndex - 1];
-  const nextActivity = activities[currentIndex + 1];
+  const timeline = state?.timeline ?? [];
+  const currentTimelineItem = state?.currentTimelineItem ?? null;
+  const currentIndex = timeline.findIndex((item) => item.id === currentTimelineItem?.id);
+  const previousTimelineItem = timeline[currentIndex - 1];
+  const nextTimelineItem = timeline[currentIndex + 1];
+  const presentationFileUrl = useMemo(() => {
+    if (!state?.presentation || !token) return "";
+    const versionParam = encodeURIComponent(`${state.presentation.id}-${state.presentation.updatedAt}`);
+    return `/api/events/${state.event.id}/presentation/file?token=${encodeURIComponent(token)}&v=${versionParam}`;
+  }, [state?.event.id, state?.presentation, token]);
+  const isPdfPage = currentTimelineItem?.type === "pdf_page";
   const isWordCloudActivity = state?.currentActivity?.type === "word_cloud";
   const hasCurrentActivity = Boolean(state?.currentActivity);
   const activityOpen = Boolean(state?.activityOpen);
@@ -1437,11 +2293,15 @@ function AdminLivePage({ liveId }: { liveId: string }) {
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
-    const liveSession = await api<LiveSessionRecord>(`/api/live-sessions/${liveId}/end`, {
-      method: "POST",
-      adminToken: token
-    });
-    setState((current) => (current ? { ...current, liveSession } : current));
+    try {
+      await api<LiveSessionRecord>(`/api/live-sessions/${liveId}/end`, {
+        method: "POST",
+        adminToken: token
+      });
+      navigate("/admin/dashboard");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "結束活動失敗");
+    }
   }
 
   return (
@@ -1507,38 +2367,57 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           </div>
           <div className="question-block">
             <small>
-              {currentIndex + 1 || 0} / {activities.length}
+              {currentIndex >= 0 ? currentIndex + 1 : 0} / {timeline.length}
             </small>
-            <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
-            <p>{state?.currentActivity?.description}</p>
-            {answerClosed ? (
-              <div className="countdown ended">已結束作答（已公布答案）</div>
-            ) : remaining !== null ? (
-              <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
-                {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
-              </div>
-            ) : hasCurrentActivity && !activityOpen ? (
-              <div className="countdown">尚未開始作答，參與者看不到題目</div>
-            ) : null}
+            {isPdfPage ? (
+              <>
+                <PdfCanvasPage
+                  className="presentation-stage"
+                  url={presentationFileUrl}
+                  pageNumber={currentTimelineItem?.pageNumber}
+                  style={presentationStageStyle(state?.presentation, currentTimelineItem?.pageNumber)}
+                />
+              </>
+            ) : (
+              <>
+                <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
+                <p>{state?.currentActivity?.description}</p>
+                {answerClosed ? (
+                  <div className="countdown ended">已結束作答（已公布答案）</div>
+                ) : remaining !== null ? (
+                  <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
+                    {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
+                  </div>
+                ) : hasCurrentActivity && !activityOpen ? (
+                  <div className="countdown">尚未開始作答，參與者看不到題目</div>
+                ) : null}
+              </>
+            )}
           </div>
           <div className="button-row">
             {hasCurrentActivity && !activityOpen ? (
               <button onClick={() => socket.send("start_activity", {})}>開始答題</button>
             ) : null}
             <button
-              disabled={!previousActivity}
-              onClick={() => socket.send("change_activity", { activityId: previousActivity.id })}
+              disabled={!previousTimelineItem}
+              onClick={() =>
+                previousTimelineItem &&
+                socket.send("change_timeline_item", { timelineItemId: previousTimelineItem.id })
+              }
             >
-              上一題
+              上一頁
             </button>
             <button
-              disabled={!nextActivity}
-              onClick={() => socket.send("change_activity", { activityId: nextActivity.id })}
+              disabled={!nextTimelineItem}
+              onClick={() =>
+                nextTimelineItem &&
+                socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id })
+              }
             >
-              下一題
+              下一頁
             </button>
             <button
-              hidden={isWordCloudActivity}
+              hidden={!hasCurrentActivity || isWordCloudActivity}
               disabled={remaining !== null && remaining > 0}
               title={
                 remaining !== null && remaining > 0 ? "倒數結束後才能公布結果" : undefined
@@ -1552,7 +2431,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
             </button>
             <button
-              hidden={isWordCloudActivity}
+              hidden={!hasCurrentActivity || isWordCloudActivity}
               onClick={() =>
                 socket.send("set_participant_name_visibility", {
                   showParticipantNames: !state?.liveSession.showParticipantNames
@@ -1565,10 +2444,12 @@ function AdminLivePage({ liveId }: { liveId: string }) {
               結束
             </button>
           </div>
-          <section className="results-panel">
-            <h2>即時結果</h2>
-            <SummaryView summary={state?.responseSummary ?? null} />
-          </section>
+          {hasCurrentActivity ? (
+            <section className="results-panel">
+              <h2>即時結果</h2>
+              <SummaryView summary={state?.responseSummary ?? null} />
+            </section>
+          ) : null}
         </section>
         <ChatPanel
           role="admin"
@@ -1772,7 +2653,11 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   });
 
   const currentActivity = state?.currentActivity ?? null;
-  const answerLocked = Boolean(localResponse) && currentActivity?.type !== "word_cloud";
+  const wordCloudRepeatAllowed =
+    currentActivity?.type === "word_cloud" ? Boolean(currentActivity.allowRepeatAnswers) : false;
+  const answerLocked =
+    Boolean(localResponse) &&
+    (currentActivity?.type !== "word_cloud" || !wordCloudRepeatAllowed);
   const myAnswer = (localResponse?.answer ?? state?.myResponse?.answer) as
     | { optionId?: unknown; text?: unknown }
     | undefined;
@@ -1795,6 +2680,28 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
         <Header title="活動" />
         <ErrorBanner message={error} />
         <button onClick={() => navigate("/")}>重新加入</button>
+      </main>
+    );
+  }
+
+  if (state?.liveSession.status === "ended") {
+    return (
+      <main className="page narrow">
+        <Header title={state.event.title} />
+        <ErrorBanner message={error} />
+        <section className="panel form-stack">
+          <h2>活動已結束</h2>
+          <p className="muted">主持人已結束這場活動。</p>
+          <button
+            onClick={() => {
+              localStorage.removeItem(PARTICIPANT_TOKEN_KEY);
+              localStorage.removeItem(PARTICIPANT_LIVE_KEY);
+              navigate("/");
+            }}
+          >
+            回首頁
+          </button>
+        </section>
       </main>
     );
   }
@@ -1827,8 +2734,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
               activity={currentActivity}
               disabled={
                 closed ||
-                state?.liveSession.status === "ended" ||
-                (currentActivity.type === "word_cloud" ? timeUp : answerLocked || timeUp)
+                state?.liveSession.status !== "active" ||
+                (currentActivity.type === "word_cloud" ? answerLocked || timeUp : answerLocked || timeUp)
               }
               revealed={revealed}
               submittedOptionId={submittedOptionId}
@@ -1838,7 +2745,9 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
                   activityId: currentActivity.id,
                   answer
                 });
-                if (sent && currentActivity.type !== "word_cloud") setLocalResponse({} as ResponseRecord);
+                if (sent && (currentActivity.type !== "word_cloud" || !wordCloudRepeatAllowed)) {
+                  setLocalResponse({} as ResponseRecord);
+                }
                 return sent;
               }}
             />
@@ -1858,7 +2767,7 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
         ) : state?.liveSession.currentActivityId ? (
           <p className="muted">主持人即將開始這一題，請稍候…</p>
         ) : (
-          <p className="muted">主持人尚未準備題目。</p>
+          <p className="muted">請看主持人畫面，等待下一個可作答題目。</p>
         )}
       </section>
       <ChatPanel

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { createBunWebSocket, serveStatic } from "hono/bun";
-import { readdir } from "node:fs/promises";
+import { mkdir, readdir, unlink } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { env, assertRuntimeConfig } from "./env";
@@ -22,9 +22,11 @@ import {
   createMessage,
   deleteActivity,
   deleteEvent,
+  deleteEventPresentation,
   endLiveSession,
   getActivity,
   getEvent,
+  getEventPresentation,
   getLiveSession,
   getLiveState,
   getMessage,
@@ -33,7 +35,10 @@ import {
   listMessages,
   moderateMessage,
   reorderActivities,
+  reorderTimelineItems,
+  saveEventPresentation,
   setCurrentActivity,
+  setCurrentTimelineItem,
   startActivity,
   setParticipantNameVisibility,
   setResultsVisibility,
@@ -66,6 +71,7 @@ const clients = new Map<string, SocketClient>();
 const rooms = new Map<string, Set<string>>();
 const messageRateLimits = new Map<string, number>();
 const revealTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const presentationUploadRoot = join(import.meta.dir, "..", "..", "uploads", "presentations");
 
 type TryCloudflareTunnelStatus = "stopped" | "starting" | "running" | "error";
 
@@ -287,6 +293,51 @@ function socketId() {
   return crypto.randomUUID();
 }
 
+function parsePdfBox(boxText: string) {
+  const values = boxText
+    .trim()
+    .split(/\s+/)
+    .map((value) => Number(value));
+  if (values.length < 4 || values.some((value) => !Number.isFinite(value))) return null;
+
+  const width = Math.abs(values[2] - values[0]);
+  const height = Math.abs(values[3] - values[1]);
+  if (width <= 0 || height <= 0) return null;
+  return { width: Math.round(width), height: Math.round(height) };
+}
+
+function findPdfPageBox(text: string, startIndex: number) {
+  const windowText = text.slice(Math.max(0, startIndex - 2500), Math.min(text.length, startIndex + 4500));
+  const matches = Array.from(
+    windowText.matchAll(/\/(?:CropBox|MediaBox)\s*\[\s*([^\]]+)\]/g)
+  );
+  const closest = matches[matches.length - 1]?.[1];
+  return closest ? parsePdfBox(closest) : null;
+}
+
+function extractPdfPageSizes(bytes: Uint8Array) {
+  const text = new TextDecoder("latin1").decode(bytes);
+  const pageMarkers = Array.from(text.matchAll(/\/Type\s*\/Page\b/g));
+  const firstPageBox = text.match(/\/(?:CropBox|MediaBox)\s*\[\s*([^\]]+)\]/)?.[1];
+  const fallbackBox = firstPageBox ? parsePdfBox(firstPageBox) : null;
+  const defaultBox = fallbackBox ?? { width: 16, height: 9 };
+
+  if (pageMarkers.length === 0) return [defaultBox];
+
+  return pageMarkers.map((match) => findPdfPageBox(text, match.index ?? 0) ?? defaultBox);
+}
+
+function presentationFilePath(storedName: string) {
+  return join(presentationUploadRoot, ...storedName.split(/[\\/]+/).filter(Boolean));
+}
+
+async function isAdminRequestOrQueryToken(c: Context) {
+  if (await isAdminRequest(c)) return true;
+  const token = c.req.query("token");
+  if (!token) return false;
+  return Boolean(await verifyAdminToken(token));
+}
+
 function addClient(client: SocketClient) {
   clients.set(client.id, client);
   const room = rooms.get(client.liveId) ?? new Set<string>();
@@ -467,6 +518,15 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       if (client.role !== "admin") throw new Error("Only admin can change activities.");
       const payload = message.payload as any;
       await setCurrentActivity(client.liveId, String(payload.activityId ?? ""));
+      await broadcastState(client.liveId);
+      await scheduleReveal(client.liveId);
+      return;
+    }
+
+    case "change_timeline_item": {
+      if (client.role !== "admin") throw new Error("Only admin can change timeline items.");
+      const payload = message.payload as any;
+      await setCurrentTimelineItem(client.liveId, String(payload.timelineItemId ?? ""));
       await broadcastState(client.liveId);
       await scheduleReveal(client.liveId);
       return;
@@ -667,6 +727,87 @@ app.put("/api/events/:eventId", requireAdmin, async (c) =>
   })
 );
 
+app.post("/api/events/:eventId/presentation", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    const eventId = c.req.param("eventId")!;
+    const form = await c.req.formData();
+    const file = form.get("file");
+
+    if (!(file instanceof File)) {
+      throw new Error("PDF file is required.");
+    }
+
+    const originalName = file.name || "presentation.pdf";
+    const isPdf =
+      file.type === "application/pdf" || originalName.toLocaleLowerCase().endsWith(".pdf");
+    if (!isPdf) throw new Error("Only PDF files are supported.");
+
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (bytes.length === 0) throw new Error("PDF file is empty.");
+    if (bytes.length > 80 * 1024 * 1024) throw new Error("PDF file is too large.");
+    const pageSizes = extractPdfPageSizes(bytes);
+
+    const previous = await getEventPresentation(eventId);
+    const storedName = `${eventId}/${crypto.randomUUID()}.pdf`;
+    const targetPath = presentationFilePath(storedName);
+    await mkdir(join(presentationUploadRoot, eventId), { recursive: true });
+    await Bun.write(targetPath, bytes);
+
+    try {
+      const updated = await saveEventPresentation({
+        eventId,
+        originalName,
+        storedName,
+        mimeType: "application/pdf",
+        fileSize: bytes.length,
+        pageCount: pageSizes.length,
+        pageSizes
+      });
+      if (!updated) throw new Error("Event not found.");
+
+      if (previous?.storedName && previous.storedName !== storedName) {
+        await unlink(presentationFilePath(previous.storedName)).catch(() => {});
+      }
+
+      return updated;
+    } catch (error) {
+      await unlink(targetPath).catch(() => {});
+      throw error;
+    }
+  }, 201)
+);
+
+app.get("/api/events/:eventId/presentation/file", async (c) => {
+  if (!(await isAdminRequestOrQueryToken(c))) {
+    return c.json({ error: "Unauthorized." }, 401);
+  }
+
+  const presentation = await getEventPresentation(c.req.param("eventId")!);
+  if (!presentation) return c.json({ error: "Presentation not found." }, 404);
+
+  return new Response(Bun.file(presentationFilePath(presentation.storedName)), {
+    headers: {
+      "Content-Type": presentation.mimeType || "application/pdf",
+      "Content-Disposition": `inline; filename="${presentation.originalName.replace(/"/g, "")}"`
+    }
+  });
+});
+
+app.delete("/api/events/:eventId/presentation", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    const eventId = c.req.param("eventId")!;
+    const previous = await getEventPresentation(eventId);
+    const updated = await deleteEventPresentation(eventId);
+    if (!updated) throw new Error("Event not found.");
+
+    if (previous?.storedName) {
+      await unlink(presentationFilePath(previous.storedName)).catch(() => {});
+    }
+
+    return updated;
+  })
+);
+
 app.delete("/api/events/:eventId", requireAdmin, async (c) =>
   routeJson(c, async () => ({ ok: await deleteEvent(c.req.param("eventId")!) }))
 );
@@ -695,6 +836,16 @@ app.put("/api/events/:eventId/activities/reorder", requireAdmin, async (c) =>
   routeJson(c, async () => {
     const body = (await readBody(c)) as any;
     return reorderActivities(c.req.param("eventId")!, Array.isArray(body.activityIds) ? body.activityIds : []);
+  })
+);
+
+app.put("/api/events/:eventId/timeline/reorder", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    const body = (await readBody(c)) as any;
+    return reorderTimelineItems(
+      c.req.param("eventId")!,
+      Array.isArray(body.timelineItemIds) ? body.timelineItemIds : []
+    );
   })
 );
 
