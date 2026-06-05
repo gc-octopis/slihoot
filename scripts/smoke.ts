@@ -105,7 +105,7 @@ async function run() {
   const activity = await api(
     "POST",
     `/api/events/${event.id}/activities`,
-    { type: "true_false", title: "smoke Q", correctAnswer: { optionId: "true" } },
+    { type: "true_false", title: "smoke Q", timeLimitSeconds: 30, correctAnswer: { optionId: "true" } },
     token
   );
   assert(activity.id, "activity not created");
