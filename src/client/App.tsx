@@ -356,6 +356,36 @@ function ErrorBanner({ message }: { message: string | null }) {
   return <div className="error-banner">{message}</div>;
 }
 
+function AutoDismissErrorBanner({
+  message,
+  onDismiss,
+  timeoutMs = 5000,
+  fadeMs = 400
+}: {
+  message: string | null;
+  onDismiss: () => void;
+  timeoutMs?: number;
+  fadeMs?: number;
+}) {
+  const [isLeaving, setIsLeaving] = useState(false);
+
+  useEffect(() => {
+    if (!message) return;
+
+    setIsLeaving(false);
+    const fadeTimer = window.setTimeout(() => setIsLeaving(true), Math.max(0, timeoutMs - fadeMs));
+    const dismissTimer = window.setTimeout(onDismiss, timeoutMs);
+
+    return () => {
+      window.clearTimeout(fadeTimer);
+      window.clearTimeout(dismissTimer);
+    };
+  }, [fadeMs, message, onDismiss, timeoutMs]);
+
+  if (!message) return null;
+  return <div className={`error-banner transient${isLeaving ? " is-leaving" : ""}`}>{message}</div>;
+}
+
 function correctOptionId(correctAnswer: unknown) {
   if (typeof correctAnswer !== "object" || correctAnswer === null) return "";
   return String((correctAnswer as { optionId?: unknown }).optionId ?? "");
@@ -3009,6 +3039,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [socketError, setSocketError] = useState<{ id: number; message: string } | null>(null);
+  const socketErrorIdRef = useRef(0);
   const [localResponse, setLocalResponse] = useState<ResponseRecord | null>(null);
 
   useEffect(() => {
@@ -3059,12 +3091,18 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
     }
   }, []);
 
+  const showSocketError = useCallback((message: string) => {
+    socketErrorIdRef.current += 1;
+    setSocketError({ id: socketErrorIdRef.current, message });
+  }, []);
+  const dismissSocketError = useCallback(() => setSocketError(null), []);
+
   const socket = useLiveSocket({
     liveId,
     role: "participant",
     token: participantToken,
     onMessage: handleMessage,
-    onError: setError
+    onError: showSocketError
   });
 
   const currentActivity = state?.currentActivity ?? null;
@@ -3106,6 +3144,11 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
       <main className="page narrow">
         <Header title={state.event.title} />
         <ErrorBanner message={error} />
+        <AutoDismissErrorBanner
+          key={socketError?.id}
+          message={socketError?.message ?? null}
+          onDismiss={dismissSocketError}
+        />
         <section className="panel form-stack">
           <h2>活動已結束</h2>
           <p className="muted">主持人已結束這場活動。</p>
@@ -3126,7 +3169,16 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   return (
     <main className="page live-layout participant">
       <Header title={state?.event.title ?? "活動中"} actions={<button onClick={() => navigate("/")}>首頁</button>} />
-      <ErrorBanner message={error} />
+      {error || socketError ? (
+        <div className="error-stack">
+          <ErrorBanner message={error} />
+          <AutoDismissErrorBanner
+            key={socketError?.id}
+            message={socketError?.message ?? null}
+            onDismiss={dismissSocketError}
+          />
+        </div>
+      ) : null}
       <section className="live-main panel">
         <div className="status-row">
           <span className={socket.connected ? "status online" : "status"} />

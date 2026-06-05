@@ -1099,6 +1099,19 @@ small {
   padding: 13px 16px;
 }
 
+.error-banner.transient {
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 400ms ease,
+    transform 400ms ease;
+}
+
+.error-banner.transient.is-leaving {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
 .muted {
   color: var(--muted);
 }
@@ -1118,8 +1131,14 @@ small {
   margin-bottom: 0;
 }
 
-.live-layout .error-banner {
+.live-layout > .error-banner {
   grid-area: error;
+}
+
+.error-stack {
+  display: grid;
+  grid-area: error;
+  gap: 10px;
 }
 
 .live-main {
