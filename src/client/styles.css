@@ -1118,12 +1118,13 @@ small {
 
 .live-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
-    "header header"
-    "error error"
-    "main chat";
+    "header"
+    "error"
+    "main";
   gap: 18px;
+  padding-bottom: 88px;
 }
 
 .live-layout .app-header {
@@ -1147,11 +1148,68 @@ small {
 }
 
 .chat-panel {
-  grid-area: chat;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  min-height: 520px;
   overflow: hidden;
+}
+
+.floating-chat {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 50;
+  display: grid;
+  width: min(420px, calc(100vw - 32px));
+  gap: 10px;
+  justify-items: end;
+  pointer-events: none;
+}
+
+.floating-chat.is-open {
+  justify-items: stretch;
+}
+
+.floating-chat > * {
+  pointer-events: auto;
+}
+
+.floating-chat-panel {
+  width: 100%;
+  height: min(640px, calc(100dvh - 48px));
+  min-height: 360px;
+}
+
+.floating-chat.admin .floating-chat-panel {
+  height: min(680px, calc(100dvh - 48px));
+}
+
+.floating-chat-toggle {
+  justify-self: end;
+  min-width: 96px;
+  min-height: 48px;
+  padding: 0 16px;
+  background: var(--ink);
+}
+
+.floating-chat-toggle:hover {
+  background: var(--accent-strong);
+}
+
+.floating-chat-toggle small,
+.floating-chat-badge {
+  display: inline-grid;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 0.78rem;
+  line-height: 1;
+}
+
+.floating-chat-badge {
+  background: var(--danger);
 }
 
 .chat-header,
@@ -1166,16 +1224,40 @@ small {
   justify-content: space-between;
 }
 
+.chat-title {
+  display: grid;
+  gap: 2px;
+}
+
 .chat-header h2 {
   margin-bottom: 0;
+}
+
+.chat-title small {
+  line-height: 1;
+}
+
+.chat-close-button {
+  background: #efe8f7;
+  color: var(--accent);
+}
+
+.chat-close-button:hover {
+  background: #e5dcf2;
+  color: var(--accent-strong);
 }
 
 .messages {
   display: grid;
   align-content: start;
   gap: 12px;
+  min-height: 0;
   padding: 16px;
   overflow: auto;
+}
+
+.chat-empty {
+  margin: 0;
 }
 
 .message {
@@ -1562,8 +1644,7 @@ small {
     grid-template-areas:
       "header"
       "error"
-      "main"
-      "chat";
+      "main";
   }
 
   .header-actions {
@@ -1582,6 +1663,18 @@ small {
   .chat-panel,
   .live-main {
     min-height: auto;
+  }
+
+  .floating-chat {
+    right: 12px;
+    bottom: 12px;
+    width: calc(100vw - 24px);
+  }
+
+  .floating-chat-panel,
+  .floating-chat.admin .floating-chat-panel {
+    height: min(620px, calc(100dvh - 24px));
+    min-height: 0;
   }
 
   .messages {

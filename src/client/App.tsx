@@ -1,4 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type {
   ActiveLiveSessionSummary,
@@ -2285,7 +2294,45 @@ function ChatPanel({
   onModerate?: (messageId: string, action: string) => void;
 }) {
   const [content, setContent] = useState("");
-  const visibleMessages = messages.filter((message) => message.status !== "deleted");
+  const [isOpen, setIsOpen] = useState(role === "admin");
+  const [unreadCount, setUnreadCount] = useState(0);
+  const knownMessageIdsRef = useRef<Set<string> | null>(null);
+  const panelId = useId();
+  const visibleMessages = useMemo(
+    () =>
+      messages
+        .filter((message) => message.status !== "deleted")
+        .sort((a, b) => {
+          if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        }),
+    [messages]
+  );
+
+  useEffect(() => {
+    const currentIds = new Set(visibleMessages.map((message) => message.id));
+    const knownIds = knownMessageIdsRef.current;
+
+    if (!knownIds) {
+      knownMessageIdsRef.current = currentIds;
+      return;
+    }
+
+    let newMessages = 0;
+    for (const messageId of currentIds) {
+      if (!knownIds.has(messageId)) newMessages += 1;
+    }
+
+    if (newMessages > 0 && !isOpen) {
+      setUnreadCount((current) => Math.min(99, current + newMessages));
+    }
+
+    knownMessageIdsRef.current = currentIds;
+  }, [isOpen, visibleMessages]);
+
+  useEffect(() => {
+    if (isOpen) setUnreadCount(0);
+  }, [isOpen]);
 
   function sendMessage(event: React.FormEvent) {
     event.preventDefault();
@@ -2295,50 +2342,88 @@ function ChatPanel({
   }
 
   return (
-    <aside className="chat-panel">
-      <div className="chat-header">
-        <h2>Q&A</h2>
-        <small>{visibleMessages.length} 則</small>
-      </div>
-      <div className="messages">
-        {visibleMessages.map((message) => (
-          <article className={`message ${message.status}`} key={message.id}>
-            <div className="message-meta">
-              <strong>{message.participantName}</strong>
-              {message.pinned ? <span>釘選</span> : null}
-              {role === "admin" && message.status !== "visible" ? <span>{message.status}</span> : null}
+    <div className={`floating-chat ${isOpen ? "is-open" : "is-collapsed"} ${role}`}>
+      {isOpen ? (
+        <aside className="chat-panel floating-chat-panel" id={panelId}>
+          <div className="chat-header">
+            <div className="chat-title">
+              <h2>Q&A</h2>
+              <small>{visibleMessages.length} 則</small>
             </div>
-            <p>{message.content}</p>
-            {role === "admin" ? (
-              <div className="button-row compact">
-                {message.status === "visible" ? (
-                  <button onClick={() => onModerate?.(message.id, "hide")}>隱藏</button>
-                ) : message.status === "hidden" ? (
-                  <button onClick={() => onModerate?.(message.id, "show")}>顯示</button>
-                ) : null}
-                <button onClick={() => onModerate?.(message.id, message.pinned ? "unpin" : "pin")}>
-                  {message.pinned ? "取消釘選" : "釘選"}
-                </button>
-                <button className="danger" onClick={() => onModerate?.(message.id, "delete")}>
-                  刪除
-                </button>
-              </div>
-            ) : null}
-          </article>
-        ))}
-      </div>
-      {role === "participant" ? (
-        <form className="chat-form" onSubmit={sendMessage}>
-          <input
-            value={content}
-            onChange={(event) => setContent(event.target.value)}
-            placeholder="輸入問題"
-            maxLength={200}
-          />
-          <button>送出</button>
-        </form>
+            <button
+              type="button"
+              className="icon-button chat-close-button"
+              aria-label="收合 Q&A"
+              onClick={() => setIsOpen(false)}
+            >
+              ×
+            </button>
+          </div>
+          <div className="messages">
+            {visibleMessages.length ? (
+              visibleMessages.map((message) => (
+                <article className={`message ${message.status}`} key={message.id}>
+                  <div className="message-meta">
+                    <strong>{message.participantName}</strong>
+                    {message.pinned ? <span>釘選</span> : null}
+                    {role === "admin" && message.status !== "visible" ? (
+                      <span>{message.status}</span>
+                    ) : null}
+                  </div>
+                  <p>{message.content}</p>
+                  {role === "admin" ? (
+                    <div className="button-row compact">
+                      {message.status === "visible" ? (
+                        <button onClick={() => onModerate?.(message.id, "hide")}>隱藏</button>
+                      ) : message.status === "hidden" ? (
+                        <button onClick={() => onModerate?.(message.id, "show")}>顯示</button>
+                      ) : null}
+                      <button
+                        onClick={() => onModerate?.(message.id, message.pinned ? "unpin" : "pin")}
+                      >
+                        {message.pinned ? "取消釘選" : "釘選"}
+                      </button>
+                      <button className="danger" onClick={() => onModerate?.(message.id, "delete")}>
+                        刪除
+                      </button>
+                    </div>
+                  ) : null}
+                </article>
+              ))
+            ) : (
+              <p className="muted chat-empty">尚無問題。</p>
+            )}
+          </div>
+          {role === "participant" ? (
+            <form className="chat-form" onSubmit={sendMessage}>
+              <input
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                placeholder="輸入問題"
+                maxLength={200}
+              />
+              <button>送出</button>
+            </form>
+          ) : null}
+        </aside>
       ) : null}
-    </aside>
+      {!isOpen ? (
+        <button
+          type="button"
+          className="floating-chat-toggle"
+          aria-controls={panelId}
+          aria-expanded={isOpen}
+          onClick={() => setIsOpen(true)}
+        >
+          <span>Q&A</span>
+          {unreadCount > 0 ? (
+            <span className="floating-chat-badge">{unreadCount >= 99 ? "99+" : unreadCount}</span>
+          ) : (
+            <small>{visibleMessages.length}</small>
+          )}
+        </button>
+      ) : null}
+    </div>
   );
 }
 
