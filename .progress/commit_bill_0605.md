@@ -172,3 +172,13 @@
 - `xlsx` 列於 `dependencies`，Dockerfile runtime 階段 `bun install --production` 會安裝；與 CI build、`deploy.yml` 部署到 GCE VM 走同一份 Dockerfile。
 - 已實際 `docker compose up -d --build` 重建容器並在容器內驗證 xlsx 匯出、排序題、計分、smoke 全數通過 —— 即與 GCP 部署相同的 image。
 - migration `0002` 於開機 `DB_AUTO_MIGRATE` 自動套用（已實測 `applied migration 0002_response_score.sql`）。
+
+### 追加修訂 4：排序編號跟著選項、結果同款編號、秒數必填
+
+承前一次 commit 之後再依需求調整（這批為第二次 commit 內容）：
+
+- **排序方塊編號「跟著選項」**：`SortableList` 左側編號改為**依選項首次出現順序給的固定編號**（存於 `numberByIdRef`，以選項 id 為 key），拖曳重排時編號跟著方塊走（原本 1,2,3,4,5 拖成 1,3,2,4,5 就顯示 1,3,2,4,5），不再每次依位置重編。切換題目（id 整組更換）時自動重置。
+- **公布結果用同款固定編號**：`ResponseSummary` 的 ranking 由 `correctOrderLabels: string[]` 改為 `correctOrder: { number, label }[]`。`number` 由**與發給參與者相同的 `seededShuffle`（呈現順序）**算出，因此結果區方塊掛的編號＝參與者作答時看到/拖曳的編號（實測：呈現順序 `[A,C,B,D,E]` → 正確順序 `A,B,C,D,E` 顯示編號 `1,3,2,4,5`，與參與者端一致）。主持端逐人明細的順序字串也改用此固定編號。
+- **關閉「0 秒＝不限時」**：無時限會讓 Kahoot 計分失去速度鑑別度。`createActivity`/`updateActivity` 在 `timeLimitSeconds <= 0` 時丟錯「請設定作答秒數（需大於 0）。」，所有題型一律必填秒數；client `saveActivity` 既有 catch 會 `window.alert` 顯示。
+- **修正秒數輸入框卡 0**：編輯器秒數欄改 `min={1}` + placeholder「例如 30」，值為 0 時顯示空字串而非 `0`，清空欄位不再卡一個 0、重打也不會出現前導 `05`。標籤改「作答秒數（必填，需大於 0）」。
+- 驗證：`typecheck`/`build` 通過；重建容器後實測 0 秒/未填秒數回 `400 請設定作答秒數`、秒數=20 成功；結果固定編號與參與者呈現順序一致（`MATCH: true`）。

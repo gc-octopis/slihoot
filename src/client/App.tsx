@@ -824,18 +824,24 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                 />
               </label>
               <label>
-                作答秒數（0 表示不限時）
+                作答秒數（必填，需大於 0）
                 <input
                   type="number"
-                  min={0}
+                  min={1}
                   max={3600}
-                  value={draft.timeLimitSeconds}
-                  onChange={(change) =>
+                  placeholder="例如 30"
+                  value={draft.timeLimitSeconds === 0 ? "" : draft.timeLimitSeconds}
+                  onChange={(change) => {
+                    const raw = change.target.value;
+                    const parsed = Math.floor(Number(raw));
                     setDraft({
                       ...draft,
-                      timeLimitSeconds: Math.max(0, Math.min(3600, Number(change.target.value) || 0))
-                    })
-                  }
+                      timeLimitSeconds:
+                        raw === "" || !Number.isFinite(parsed) || parsed < 0
+                          ? 0
+                          : Math.min(3600, parsed)
+                    });
+                  }}
                 />
               </label>
               {draft.type === "multiple_choice" || draft.type === "true_false" ? (
@@ -1098,6 +1104,23 @@ function SortableList({
   const orderKeyRef = useRef<string>("");
   const slotMidpointsRef = useRef<number[]>([]);
 
+  // Stable badge number that stays with each option: assigned by the order an
+  // option is first seen, so dragging reorders the blocks but each keeps its
+  // original number (1,2,3,4,5 dragged into 1,3,2,4,5). Resets when the item set
+  // changes entirely (e.g. switching to a different question).
+  const numberByIdRef = useRef<Map<string, number>>(new Map());
+  const maxNumberRef = useRef(0);
+  if (numberByIdRef.current.size > 0 && !items.some((option) => numberByIdRef.current.has(option.id))) {
+    numberByIdRef.current = new Map();
+    maxNumberRef.current = 0;
+  }
+  for (const option of items) {
+    if (!numberByIdRef.current.has(option.id)) {
+      maxNumberRef.current += 1;
+      numberByIdRef.current.set(option.id, maxNumberRef.current);
+    }
+  }
+
   // FLIP: when the *order* actually changes (a reorder), slide each non-dragged
   // block from its old position to its new one. Gated on the id sequence so it
   // never fires on unrelated re-renders (e.g. typing a label in the editor),
@@ -1207,7 +1230,7 @@ function SortableList({
           <span className="drag-handle" aria-hidden>
             ⠿
           </span>
-          <span className="rank">{index + 1}</span>
+          <span className="rank">{numberByIdRef.current.get(option.id) ?? index + 1}</span>
           {renderItem(option, index)}
         </li>
       ))}
@@ -1221,7 +1244,7 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
   if (summary.type === "ranking") {
     return (
       <div className="answer-list">
-        {summary.correctOrderLabels?.length ? (
+        {summary.correctOrder?.length ? (
           <>
             <p className="muted">
               正確順序
@@ -1230,10 +1253,10 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
                 : null}
             </p>
             <ol className="result-order">
-              {summary.correctOrderLabels.map((label, index) => (
-                <li className="result-order-item" key={`${label}-${index}`}>
-                  <span className="rank">{index + 1}</span>
-                  <span className="name">{label}</span>
+              {summary.correctOrder.map((entry, index) => (
+                <li className="result-order-item" key={`${entry.number}-${index}`}>
+                  <span className="rank">{entry.number}</span>
+                  <span className="name">{entry.label}</span>
                 </li>
               ))}
             </ol>
