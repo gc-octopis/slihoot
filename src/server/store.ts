@@ -1997,7 +1997,8 @@ export async function getLiveState(
 
 export async function createMessage(input: {
   liveId: string;
-  participantId: string;
+  participantId: string | null;
+  senderName?: string;
   content: unknown;
 }) {
   const liveSession = await getLiveSession(input.liveId);
@@ -2009,13 +2010,15 @@ export async function createMessage(input: {
   if (!content) throw new Error("Message content is required.");
 
   const messageId = id();
+  const senderName = normalizeText(input.senderName, 80) || null;
   await pool.execute(
-    `INSERT INTO live_messages (id, live_session_id, participant_id, content)
-     VALUES (:id, :liveId, :participantId, :content)`,
+    `INSERT INTO live_messages (id, live_session_id, participant_id, sender_name, content)
+     VALUES (:id, :liveId, :participantId, :senderName, :content)`,
     {
       id: messageId,
       liveId: input.liveId,
       participantId: input.participantId,
+      senderName,
       content
     }
   );
@@ -2029,7 +2032,7 @@ export async function getMessage(messageId: string) {
       m.id,
       m.live_session_id AS liveSessionId,
       m.participant_id AS participantId,
-      p.nickname AS participantName,
+      COALESCE(m.sender_name, p.nickname, '主持人') AS participantName,
       m.content,
       m.status,
       m.pinned,
@@ -2037,7 +2040,7 @@ export async function getMessage(messageId: string) {
       m.updated_at AS updatedAt,
       m.moderated_at AS moderatedAt
     FROM live_messages m
-    INNER JOIN participants p ON p.id = m.participant_id
+    LEFT JOIN participants p ON p.id = m.participant_id
     WHERE m.id = :messageId`,
     { messageId }
   );
@@ -2052,7 +2055,7 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
       m.id,
       m.live_session_id AS liveSessionId,
       m.participant_id AS participantId,
-      p.nickname AS participantName,
+      COALESCE(m.sender_name, p.nickname, '主持人') AS participantName,
       m.content,
       m.status,
       m.pinned,
@@ -2060,7 +2063,7 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
       m.updated_at AS updatedAt,
       m.moderated_at AS moderatedAt
     FROM live_messages m
-    INNER JOIN participants p ON p.id = m.participant_id
+    LEFT JOIN participants p ON p.id = m.participant_id
     WHERE m.live_session_id = :liveId
       AND m.status <> 'deleted'
       AND (:includeHidden = TRUE OR m.status = 'visible')
@@ -2074,7 +2077,8 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
 export async function moderateMessage(input: {
   liveId: string;
   messageId: string;
-  action: "hide" | "show" | "delete" | "pin" | "unpin";
+  action: "hide" | "show" | "delete" | "pin" | "unpin" | "edit";
+  content?: unknown;
 }) {
   const actionToStatus: Partial<Record<typeof input.action, MessageStatus>> = {
     hide: "hidden",
@@ -2084,7 +2088,20 @@ export async function moderateMessage(input: {
 
   const status = actionToStatus[input.action];
 
-  if (status) {
+  if (input.action === "edit") {
+    const content = normalizeText(input.content, 200);
+    if (!content) throw new Error("Message content is required.");
+    await pool.execute(
+      `UPDATE live_messages
+       SET content = :content
+       WHERE id = :messageId AND live_session_id = :liveId AND status <> 'deleted'`,
+      {
+        liveId: input.liveId,
+        messageId: input.messageId,
+        content
+      }
+    );
+  } else if (status) {
     await pool.execute(
       `UPDATE live_messages
        SET status = :status,

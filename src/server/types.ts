@@ -115,7 +115,7 @@ export interface ResponseRecord {
 export interface LiveMessageRecord {
   id: string;
   liveSessionId: string;
-  participantId: string;
+  participantId: string | null;
   participantName: string;
   content: string;
   status: MessageStatus;

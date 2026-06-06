@@ -1179,10 +1179,6 @@ small {
   min-height: 360px;
 }
 
-.floating-chat.admin .floating-chat-panel {
-  height: min(680px, calc(100dvh - 48px));
-}
-
 .floating-chat-toggle {
   justify-self: end;
   min-width: 96px;
@@ -1212,16 +1208,12 @@ small {
   background: var(--danger);
 }
 
-.chat-header,
-.chat-form {
-  padding: 16px;
-  border-bottom: 1px solid var(--border);
-}
-
 .chat-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
 }
 
 .chat-title {
@@ -1260,11 +1252,139 @@ small {
   margin: 0;
 }
 
+.message-shell {
+  position: relative;
+  width: min(88%, 360px);
+}
+
+.message-shell.own-message {
+  justify-self: end;
+}
+
+.message-shell.other-message {
+  justify-self: start;
+}
+
 .message {
+  overflow: hidden;
   border: 1px solid rgba(231, 220, 205, 0.86);
   border-radius: 22px;
   padding: 14px;
   background: var(--surface-tint);
+}
+
+.message-shell.own-message .message {
+  border-color: rgba(75, 47, 143, 0.2);
+  background: #f1ecfb;
+}
+
+.message-shell.host-message .message-meta strong {
+  color: var(--accent);
+}
+
+.message p {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-edit-form {
+  display: grid;
+  gap: 10px;
+}
+
+.message-edit-form textarea {
+  min-height: 78px;
+  max-height: 180px;
+  resize: none;
+  overflow-y: auto;
+  line-height: 1.4;
+}
+
+.message-edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.message-edit-actions button {
+  min-height: 34px;
+  padding: 0 12px;
+  font-size: 0.84rem;
+}
+
+.message-shell.manageable-message::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: rgba(255, 255, 255, 0.72);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+
+.message-shell.manageable-message.is-moderating::after {
+  opacity: 1;
+}
+
+.message-edit-button {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  background: rgba(255, 255, 255, 0.86);
+  color: var(--accent);
+  font-size: 0.82rem;
+  box-shadow: 0 6px 16px rgba(42, 32, 56, 0.12);
+}
+
+.message-edit-button:hover,
+.message-edit-button:focus-visible {
+  background: #efe8f7;
+  color: var(--accent-strong);
+}
+
+.message-shell.manageable-message.is-moderating .message-edit-button {
+  z-index: 3;
+  background: var(--accent);
+  color: #fff;
+}
+
+.message-moderation-actions {
+  position: absolute;
+  top: 14px;
+  right: 52px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: calc(100% - 66px);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(4px);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.message-shell.manageable-message.is-moderating .message-moderation-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.message-moderation-actions button {
+  min-height: 34px;
+  padding: 0 12px;
+  font-size: 0.84rem;
+  box-shadow: 0 8px 18px rgba(42, 32, 56, 0.16);
 }
 
 .message.hidden {
@@ -1292,12 +1412,37 @@ small {
   font-weight: 800;
 }
 
+.chat-footer {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.chat-error {
+  border: 1px solid rgba(190, 56, 52, 0.26);
+  border-radius: 16px;
+  background: rgba(190, 56, 52, 0.09);
+  color: var(--danger);
+  padding: 10px 12px;
+  font-size: 0.9rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
 .chat-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
-  border-top: 1px solid var(--border);
-  border-bottom: 0;
+  align-items: end;
+}
+
+.chat-form textarea {
+  min-height: 46px;
+  max-height: 132px;
+  resize: none;
+  overflow-y: auto;
+  line-height: 1.35;
 }
 
 .status-row {
@@ -1671,14 +1816,17 @@ small {
     width: calc(100vw - 24px);
   }
 
-  .floating-chat-panel,
-  .floating-chat.admin .floating-chat-panel {
+  .floating-chat-panel {
     height: min(620px, calc(100dvh - 24px));
     min-height: 0;
   }
 
   .messages {
     max-height: 360px;
+  }
+
+  .message-shell {
+    width: min(94%, 360px);
   }
 
   .modal-layer {

@@ -61,16 +61,6 @@ type ActivityDraft = {
   correctText: string;
 };
 
-type TryCloudflareTunnelState = {
-  status: "stopped" | "starting" | "running" | "error";
-  localUrl: string | null;
-  publicUrl: string | null;
-  pid: number | null;
-  startedAt: string | null;
-  lastError: string | null;
-  logs: string[];
-};
-
 type PdfViewport = {
   width: number;
   height: number;
@@ -2285,18 +2275,29 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
 function ChatPanel({
   role,
   messages,
+  currentParticipantId,
+  chatError,
+  onChatErrorDismiss,
   onSend,
   onModerate
 }: {
   role: "admin" | "participant";
   messages: LiveMessageRecord[];
+  currentParticipantId?: string | null;
+  chatError?: { id: number; message: string } | null;
+  onChatErrorDismiss?: () => void;
   onSend?: (content: string) => void;
-  onModerate?: (messageId: string, action: string) => void;
+  onModerate?: (messageId: string, action: string, content?: string) => void;
 }) {
   const [content, setContent] = useState("");
   const [isOpen, setIsOpen] = useState(role === "admin");
   const [unreadCount, setUnreadCount] = useState(0);
+  const [activeModerationMessageId, setActiveModerationMessageId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingContent, setEditingContent] = useState("");
   const knownMessageIdsRef = useRef<Set<string> | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
   const panelId = useId();
   const visibleMessages = useMemo(
     () =>
@@ -2334,11 +2335,90 @@ function ChatPanel({
     if (isOpen) setUnreadCount(0);
   }, [isOpen]);
 
+  useEffect(() => {
+    if (!chatError) return;
+    setIsOpen(true);
+    const timer = window.setTimeout(() => onChatErrorDismiss?.(), 2600);
+    return () => window.clearTimeout(timer);
+  }, [chatError, onChatErrorDismiss]);
+
+  useEffect(() => {
+    if (!visibleMessages.some((message) => message.id === activeModerationMessageId)) {
+      setActiveModerationMessageId(null);
+    }
+  }, [activeModerationMessageId, visibleMessages]);
+
+  useEffect(() => {
+    if (!visibleMessages.some((message) => message.id === editingMessageId)) {
+      setEditingMessageId(null);
+      setEditingContent("");
+    }
+  }, [editingMessageId, visibleMessages]);
+
+  useLayoutEffect(() => {
+    const input = chatInputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 132)}px`;
+  }, [content]);
+
+  useLayoutEffect(() => {
+    const input = editInputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+  }, [editingContent]);
+
   function sendMessage(event: React.FormEvent) {
     event.preventDefault();
     if (!content.trim()) return;
     onSend?.(content);
     setContent("");
+  }
+
+  function handleMessageInputKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    if (!content.trim()) return;
+    onSend?.(content);
+    setContent("");
+  }
+
+  function moderateMessage(messageId: string, action: string) {
+    onModerate?.(messageId, action);
+    setActiveModerationMessageId(null);
+  }
+
+  function startEditingMessage(message: LiveMessageRecord) {
+    setEditingMessageId(message.id);
+    setEditingContent(message.content);
+    setActiveModerationMessageId(null);
+    window.setTimeout(() => editInputRef.current?.focus(), 0);
+  }
+
+  function cancelEditingMessage() {
+    setEditingMessageId(null);
+    setEditingContent("");
+  }
+
+  function saveEditingMessage() {
+    if (!editingMessageId) return;
+    const nextContent = editingContent.trim();
+    if (!nextContent) return;
+    onModerate?.(editingMessageId, "edit", nextContent);
+    setEditingMessageId(null);
+    setEditingContent("");
+  }
+
+  function handleEditInputKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEditingMessage();
+      return;
+    }
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    saveEditingMessage();
   }
 
   return (
@@ -2361,49 +2441,153 @@ function ChatPanel({
           </div>
           <div className="messages">
             {visibleMessages.length ? (
-              visibleMessages.map((message) => (
-                <article className={`message ${message.status}`} key={message.id}>
-                  <div className="message-meta">
-                    <strong>{message.participantName}</strong>
-                    {message.pinned ? <span>釘選</span> : null}
-                    {role === "admin" && message.status !== "visible" ? (
-                      <span>{message.status}</span>
+              visibleMessages.map((message) => {
+                const canManageMessage =
+                  Boolean(onModerate) &&
+                  (role === "admin" ||
+                    (role === "participant" &&
+                      Boolean(currentParticipantId) &&
+                      message.participantId === currentParticipantId));
+                const canEditMessage =
+                  Boolean(onModerate) &&
+                  ((role === "admin" && message.participantId === null) ||
+                    (role === "participant" &&
+                      Boolean(currentParticipantId) &&
+                      message.participantId === currentParticipantId));
+                const isOwnMessage =
+                  (role === "admin" && message.participantId === null) ||
+                  (role === "participant" &&
+                    Boolean(currentParticipantId) &&
+                    message.participantId === currentParticipantId);
+                const isModerating = canManageMessage && activeModerationMessageId === message.id;
+                const isEditing = canEditMessage && editingMessageId === message.id;
+                return (
+                  <div
+                    className={`message-shell${canManageMessage ? " manageable-message" : ""}${
+                      isModerating ? " is-moderating" : ""
+                    }${message.participantId === null ? " host-message" : ""}${
+                      isOwnMessage ? " own-message" : " other-message"
+                    }`}
+                    key={message.id}
+                  >
+                    <article className={`message ${message.status}`}>
+                      <div className="message-meta">
+                        <strong>{message.participantName}</strong>
+                        {message.pinned ? <span>釘選</span> : null}
+                        {role === "admin" && message.status !== "visible" ? (
+                          <span>{message.status}</span>
+                        ) : null}
+                      </div>
+                      {isEditing ? (
+                        <div className="message-edit-form">
+                          <textarea
+                            ref={editInputRef}
+                            value={editingContent}
+                            onChange={(event) => setEditingContent(event.target.value)}
+                            onKeyDown={handleEditInputKeyDown}
+                            maxLength={200}
+                          />
+                          <div className="message-edit-actions">
+                            <button type="button" onClick={saveEditingMessage}>
+                              儲存
+                            </button>
+                            <button type="button" className="secondary" onClick={cancelEditingMessage}>
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
+                    </article>
+                    {canManageMessage && !isEditing ? (
+                      <>
+                        <button
+                          type="button"
+                          className="icon-button message-edit-button"
+                          aria-label="管理留言"
+                          aria-expanded={isModerating}
+                          onClick={() =>
+                            setActiveModerationMessageId((current) =>
+                              current === message.id ? null : message.id
+                            )
+                          }
+                        >
+                          ✎
+                        </button>
+                        {role === "admin" ? (
+                          <div
+                            className="message-moderation-actions"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            {message.status === "visible" ? (
+                              <button onClick={() => moderateMessage(message.id, "hide")}>
+                                隱藏
+                              </button>
+                            ) : message.status === "hidden" ? (
+                              <button onClick={() => moderateMessage(message.id, "show")}>
+                                顯示
+                              </button>
+                            ) : null}
+                            {canEditMessage ? (
+                              <button onClick={() => startEditingMessage(message)}>修改</button>
+                            ) : null}
+                            <button
+                              onClick={() =>
+                                moderateMessage(message.id, message.pinned ? "unpin" : "pin")
+                              }
+                            >
+                              {message.pinned ? "取消釘選" : "釘選"}
+                            </button>
+                            <button
+                              className="danger"
+                              onClick={() => moderateMessage(message.id, "delete")}
+                            >
+                              刪除
+                            </button>
+                          </div>
+                        ) : (
+                          <div
+                            className="message-moderation-actions participant-message-actions"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            <button onClick={() => startEditingMessage(message)}>修改</button>
+                            <button
+                              className="danger"
+                              onClick={() => moderateMessage(message.id, "delete")}
+                            >
+                              收回
+                            </button>
+                          </div>
+                        )}
+                      </>
                     ) : null}
                   </div>
-                  <p>{message.content}</p>
-                  {role === "admin" ? (
-                    <div className="button-row compact">
-                      {message.status === "visible" ? (
-                        <button onClick={() => onModerate?.(message.id, "hide")}>隱藏</button>
-                      ) : message.status === "hidden" ? (
-                        <button onClick={() => onModerate?.(message.id, "show")}>顯示</button>
-                      ) : null}
-                      <button
-                        onClick={() => onModerate?.(message.id, message.pinned ? "unpin" : "pin")}
-                      >
-                        {message.pinned ? "取消釘選" : "釘選"}
-                      </button>
-                      <button className="danger" onClick={() => onModerate?.(message.id, "delete")}>
-                        刪除
-                      </button>
-                    </div>
-                  ) : null}
-                </article>
-              ))
+                );
+              })
             ) : (
               <p className="muted chat-empty">尚無問題。</p>
             )}
           </div>
-          {role === "participant" ? (
-            <form className="chat-form" onSubmit={sendMessage}>
-              <input
-                value={content}
-                onChange={(event) => setContent(event.target.value)}
-                placeholder="輸入問題"
-                maxLength={200}
-              />
-              <button>送出</button>
-            </form>
+          {onSend ? (
+            <div className="chat-footer">
+              {chatError ? (
+                <div className="chat-error" role="status" aria-live="polite">
+                  {chatError.message}
+                </div>
+              ) : null}
+              <form className="chat-form" onSubmit={sendMessage}>
+                <textarea
+                  ref={chatInputRef}
+                  value={content}
+                  onChange={(event) => setContent(event.target.value)}
+                  onKeyDown={handleMessageInputKeyDown}
+                  placeholder="輸入問題"
+                  maxLength={200}
+                />
+                <button>送出</button>
+              </form>
+            </div>
           ) : null}
         </aside>
       ) : null}
@@ -2547,98 +2731,25 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+  const chatErrorIdRef = useRef(0);
   const copyTimerRef = useRef<number | null>(null);
   const qrDialogRef = useRef<HTMLDialogElement | null>(null);
-  const [tryTunnel, setTryTunnel] = useState<TryCloudflareTunnelState | null>(null);
-  const tunnelPollRef = useRef<number | null>(null);
-  const localPortForTunnel = useMemo(() => {
-    const port = window.location.port ? Number(window.location.port) : NaN;
-    if (Number.isFinite(port) && port > 0) return port;
-    return window.location.protocol === "https:" ? 443 : 80;
-  }, []);
-  const autoTunnelAttemptRef = useRef<string | null>(null);
 
   const joinCode = state?.liveSession.joinCode ?? "";
-  // On a real public domain (e.g. https://slihoot.me) the page's own origin is
-  // already shareable, so the join link should just use it. The Cloudflare
-  // tunnel is only needed for local dev where the origin is localhost.
-  const isLocalhostOrigin = ["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(
-    window.location.hostname
-  );
-  const effectiveBaseUrl = useMemo(() => {
-    const tunnelUrl = tryTunnel?.status === "running" ? tryTunnel.publicUrl : null;
-    return tunnelUrl ?? window.location.origin;
-  }, [tryTunnel?.publicUrl, tryTunnel?.status]);
   const joinUrl = useMemo(() => {
     if (!joinCode) return "";
-    if (!effectiveBaseUrl) return "";
-    const url = new URL("/", effectiveBaseUrl);
+    const url = new URL("/", window.location.origin);
     url.searchParams.set("joinCode", joinCode);
     return url.toString();
-  }, [effectiveBaseUrl, joinCode]);
+  }, [joinCode]);
 
   useEffect(() => {
     return () => {
       if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
     };
   }, []);
-
-  const loadTryTunnelState = useCallback(async () => {
-    if (!token) return null;
-    const loaded = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare", {
-      adminToken: token
-    });
-    setTryTunnel(loaded);
-    return loaded;
-  }, [token]);
-
-  useEffect(() => {
-    if (!token) return;
-    loadTryTunnelState().catch(() => {});
-  }, [loadTryTunnelState, token]);
-
-  useEffect(() => {
-    if (!token) return;
-    if (tryTunnel?.status !== "starting") return;
-
-    if (tunnelPollRef.current) window.clearInterval(tunnelPollRef.current);
-    const timer = window.setInterval(() => {
-      loadTryTunnelState().catch(() => {});
-    }, 800);
-    tunnelPollRef.current = timer;
-
-    return () => {
-      window.clearInterval(timer);
-      if (tunnelPollRef.current === timer) tunnelPollRef.current = null;
-    };
-  }, [loadTryTunnelState, token, tryTunnel?.status]);
-
-  const startTryTunnel = useCallback(async () => {
-    if (!token) return;
-    try {
-      const started = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare/start", {
-        method: "POST",
-        adminToken: token,
-        body: { port: localPortForTunnel }
-      });
-      setTryTunnel(started);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to start tunnel.");
-    }
-  }, [localPortForTunnel, token]);
-
-  useEffect(() => {
-    if (!token) return;
-    if (!joinCode) return;
-    // Public/LAN origin is already shareable — only auto-start a tunnel on localhost.
-    if (!isLocalhostOrigin) return;
-    if (tryTunnel?.status === "running" || tryTunnel?.status === "starting") return;
-    if (autoTunnelAttemptRef.current === joinCode) return;
-
-    autoTunnelAttemptRef.current = joinCode;
-    startTryTunnel();
-  }, [isLocalhostOrigin, joinCode, startTryTunnel, token, tryTunnel?.status]);
 
   const copyJoinUrl = useCallback(async () => {
     if (!joinUrl) return;
@@ -2651,12 +2762,9 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const openJoinQr = useCallback(() => {
     const dialog = qrDialogRef.current;
     if (!dialog) return;
-    if (isLocalhostOrigin && tryTunnel?.status !== "running" && tryTunnel?.status !== "starting") {
-      startTryTunnel();
-    }
     if (dialog.open) return;
     dialog.showModal();
-  }, [isLocalhostOrigin, startTryTunnel, tryTunnel?.status]);
+  }, []);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -2711,12 +2819,18 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     }
   }, []);
 
+  const showChatError = useCallback((message: string) => {
+    chatErrorIdRef.current += 1;
+    setChatError({ id: chatErrorIdRef.current, message });
+  }, []);
+  const dismissChatError = useCallback(() => setChatError(null), []);
+
   const socket = useLiveSocket({
     liveId,
     role: "admin",
     token,
     onMessage: handleMessage,
-    onError: setError
+    onError: showChatError
   });
 
   const remaining = useServerCountdown(state);
@@ -2803,10 +2917,6 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                 ×
               </button>
             </div>
-            {tryTunnel?.status === "starting" ? (
-              <p className="muted">Cloudflare 分享連結產生中...</p>
-            ) : null}
-            {tryTunnel?.lastError ? <div className="error-banner">{tryTunnel.lastError}</div> : null}
             {joinUrl ? (
               <div className="qr-preview">
                 <QRCodeSVG value={joinUrl} size={260} marginSize={4} />
@@ -2950,8 +3060,11 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         <ChatPanel
           role="admin"
           messages={messages}
-          onModerate={(messageId, action) =>
-            socket.send("moderate_message", { messageId, action })
+          chatError={chatError}
+          onChatErrorDismiss={dismissChatError}
+          onSend={(content) => socket.send("send_message", { content })}
+          onModerate={(messageId, action, content) =>
+            socket.send("moderate_message", { messageId, action, content })
           }
         />
       </main>
@@ -3124,8 +3237,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [socketError, setSocketError] = useState<{ id: number; message: string } | null>(null);
-  const socketErrorIdRef = useRef(0);
+  const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
+  const chatErrorIdRef = useRef(0);
   const [localResponse, setLocalResponse] = useState<ResponseRecord | null>(null);
 
   useEffect(() => {
@@ -3164,6 +3277,12 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
     }
     if (message.type === "message_updated") {
       const payload = message.payload as any;
+      if (payload.message) {
+        setMessages((current) =>
+          mergeMessage(current, payload.message).filter((candidate) => candidate.status === "visible")
+        );
+        return;
+      }
       setMessages((current) =>
         current
           .map((candidate) =>
@@ -3176,18 +3295,18 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
     }
   }, []);
 
-  const showSocketError = useCallback((message: string) => {
-    socketErrorIdRef.current += 1;
-    setSocketError({ id: socketErrorIdRef.current, message });
+  const showChatError = useCallback((message: string) => {
+    chatErrorIdRef.current += 1;
+    setChatError({ id: chatErrorIdRef.current, message });
   }, []);
-  const dismissSocketError = useCallback(() => setSocketError(null), []);
+  const dismissChatError = useCallback(() => setChatError(null), []);
 
   const socket = useLiveSocket({
     liveId,
     role: "participant",
     token: participantToken,
     onMessage: handleMessage,
-    onError: showSocketError
+    onError: showChatError
   });
 
   const currentActivity = state?.currentActivity ?? null;
@@ -3229,11 +3348,6 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
       <main className="page narrow">
         <Header title={state.event.title} />
         <ErrorBanner message={error} />
-        <AutoDismissErrorBanner
-          key={socketError?.id}
-          message={socketError?.message ?? null}
-          onDismiss={dismissSocketError}
-        />
         <section className="panel form-stack">
           <h2>活動已結束</h2>
           <p className="muted">主持人已結束這場活動。</p>
@@ -3254,14 +3368,9 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   return (
     <main className="page live-layout participant">
       <Header title={state?.event.title ?? "活動中"} actions={<button onClick={() => navigate("/")}>首頁</button>} />
-      {error || socketError ? (
+      {error ? (
         <div className="error-stack">
           <ErrorBanner message={error} />
-          <AutoDismissErrorBanner
-            key={socketError?.id}
-            message={socketError?.message ?? null}
-            onDismiss={dismissSocketError}
-          />
         </div>
       ) : null}
       <section className="live-main panel">
@@ -3334,7 +3443,13 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
       <ChatPanel
         role="participant"
         messages={sortedMessages}
+        currentParticipantId={state?.me?.id}
+        chatError={chatError}
+        onChatErrorDismiss={dismissChatError}
         onSend={(content) => socket.send("send_message", { content })}
+        onModerate={(messageId, action, content) =>
+          socket.send("moderate_message", { messageId, action, content })
+        }
       />
     </main>
   );

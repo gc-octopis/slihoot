@@ -511,7 +511,8 @@ async function broadcastMessageUpdate(message: LiveMessageRecord) {
       payload: {
         messageId: message.id,
         status: message.status,
-        pinned: message.pinned
+        pinned: message.pinned,
+        message: message.status === "visible" ? message : undefined
       }
     });
   }
@@ -583,16 +584,19 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
     }
 
     case "send_message": {
-      if (client.role !== "participant" || !client.participantId) {
-        throw new Error("Only participants can send messages.");
+      if (client.role !== "admin" && (!client.participantId || client.role !== "participant")) {
+        throw new Error("Only live session users can send messages.");
       }
-      if (!(await allowRateLimit(`rl:msg:${client.participantId}`, 1, 2))) {
+      const rateLimitKey =
+        client.role === "admin" ? `rl:msg:admin:${client.liveId}` : `rl:msg:${client.participantId}`;
+      if (!(await allowRateLimit(rateLimitKey, 1, 2))) {
         throw new Error("Please wait before sending another message.");
       }
       const payload = message.payload as any;
       const newMessage = await createMessage({
         liveId: client.liveId,
-        participantId: client.participantId,
+        participantId: client.role === "participant" ? (client.participantId ?? null) : null,
+        senderName: client.role === "admin" ? "主持人" : undefined,
         content: payload.content
       });
       if (newMessage) await broadcastNewMessage(newMessage);
@@ -600,16 +604,42 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
     }
 
     case "moderate_message": {
-      if (client.role !== "admin") throw new Error("Only admin can moderate messages.");
       const payload = message.payload as any;
       const action = String(payload.action ?? "");
-      if (!["hide", "show", "delete", "pin", "unpin"].includes(action)) {
+      if (!["hide", "show", "delete", "pin", "unpin", "edit"].includes(action)) {
         throw new Error("Invalid moderation action.");
+      }
+      const messageId = String(payload.messageId ?? "");
+      const existingMessage = await getMessage(messageId);
+      if (client.role !== "admin") {
+        if (
+          client.role !== "participant" ||
+          !["delete", "edit"].includes(action) ||
+          !client.participantId
+        ) {
+          throw new Error("Only admin can moderate messages.");
+        }
+        if (
+          !existingMessage ||
+          existingMessage.liveSessionId !== client.liveId ||
+          existingMessage.participantId !== client.participantId
+        ) {
+          throw new Error("Only the message owner can recall this message.");
+        }
+      } else if (action === "edit") {
+        if (
+          !existingMessage ||
+          existingMessage.liveSessionId !== client.liveId ||
+          existingMessage.participantId !== null
+        ) {
+          throw new Error("Only the message owner can edit this message.");
+        }
       }
       const updatedMessage = await moderateMessage({
         liveId: client.liveId,
-        messageId: String(payload.messageId ?? ""),
-        action: action as any
+        messageId,
+        action: action as any,
+        content: payload.content
       });
       if (updatedMessage) await broadcastMessageUpdate(updatedMessage);
       return;
