@@ -243,27 +243,106 @@ small {
 
 .app-header {
   display: grid;
+  position: fixed;
   grid-template-columns: auto minmax(0, 1fr) auto;
+  background-color: var(--surface-tint);
   align-items: center;
   gap: 18px;
   margin-bottom: 24px;
+  margin-left: auto;
+  margin-right: auto;
+  width: 100vw;
+  height: 60px;
+  padding: 0 16px;
+  z-index: 99999;
+  border-bottom: 1px solid var(--border);
+}
+
+.header-spacing
+{
+  height: 60px;
 }
 
 .brand {
-  min-width: 108px;
-  background: var(--ink);
+  height: 80%;
+  display: flex;
+  align-items: center;
   color: #fff;
+  cursor: pointer;
+  transition: opacity 0.2s ease;
+  flex-shrink: 0;
 }
 
 .brand:hover {
-  background: var(--accent-strong);
+  opacity: 0.8;
+}
+
+.logo-full {
+  height: 100%;
+  width: auto;
+  display: block;
+  object-fit: contain;
+}
+
+.logo-mark {
+  height: 100%;
+  width: auto;
+  display: none;
+  object-fit: contain;
+}
+
+.header-title {
+  margin-bottom: 0;
+  font-size: clamp(1rem, 2vw, 1.4rem);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink);
+  font-family: Georgia, "Times New Roman", "Noto Serif TC", ui-serif, serif;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.header-dropdown-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.header-menu-button {
+  flex-shrink: 0;
+  font-size: 1.3rem;
+  font-weight: 400;
+}
+
+.header-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 100000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 160px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(38, 33, 49, 0.14) !important;
+}
+
+.header-dropdown button {
+  width: 100%;
+  justify-content: flex-start;
+  border-radius: 12px;
+  min-height: 40px;
+  font-size: 0.9rem;
 }
 
 .panel,
@@ -1757,7 +1836,6 @@ small {
     padding-top: 22px;
   }
 
-  .app-header,
   .item-card,
   .timeline-card-body,
   .event-editor-layout,
@@ -1792,8 +1870,18 @@ small {
       "main";
   }
 
-  .header-actions {
-    justify-content: flex-start;
+  /* Swap to mark-only logo on small screens */
+  .logo-full {
+    display: none;
+  }
+
+  .logo-mark {
+    display: block;
+  }
+
+  .brand {
+    aspect-ratio: 1 / 1;
+    width: 44px;
   }
 
   .activity-launch-card {
@@ -2065,4 +2153,260 @@ small {
 .result-order-item .name {
   flex: 1;
   font-weight: 600;
+}
+
+/* ─── Fullscreen mode ───────────────────────────────────────────── */
+.fullscreen-container {
+  display: none;
+}
+
+.fullscreen-container.is-fullscreen {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  background: #0d0a14;
+  color: #fff;
+}
+
+.fullscreen-container.is-fullscreen.hide-controls .fullscreen-controls {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(100%);
+}
+
+.fullscreen-stage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.fullscreen-pdf {
+  max-height: 100% !important;
+  border-radius: 0 !important;
+  border: 0 !important;
+  background: #000 !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.fullscreen-activity {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 40px;
+  text-align: center;
+  max-width: 900px;
+  width: 100%;
+}
+
+.fullscreen-activity h2 {
+  font-size: clamp(1.8rem, 4vw, 3.2rem);
+  color: #fff;
+  margin-bottom: 0;
+}
+
+.fullscreen-activity p {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 1.1rem;
+}
+
+.fullscreen-results {
+  width: 100%;
+  max-width: 700px;
+  margin-top: 16px;
+}
+
+.fullscreen-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  background: rgba(13, 10, 20, 0.92);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+
+.fullscreen-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.9rem;
+}
+
+.fullscreen-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.fullscreen-buttons button {
+  min-height: 38px;
+  padding: 0 14px;
+  font-size: 0.88rem;
+}
+
+/* ─── Message bubble toasts ─────────────────────────────────────── */
+.bubble-toast-stack {
+  position: fixed;
+  bottom: 84px;
+  right: 24px;
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+  pointer-events: none;
+  max-width: min(340px, calc(100vw - 48px));
+}
+
+.fullscreen-container.is-fullscreen + * .bubble-toast-stack,
+.fullscreen-container.is-fullscreen ~ .bubble-toast-stack {
+  z-index: 1000000;
+}
+
+.message-bubble-toast {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px;
+  border-radius: 18px;
+  background: rgba(38, 33, 49, 0.92);
+  backdrop-filter: blur(10px);
+  color: #fff;
+  font-size: 0.88rem;
+  max-width: 100%;
+  word-break: break-word;
+  animation: bubble-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+  pointer-events: none;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.message-bubble-toast strong {
+  color: var(--accent-soft);
+  font-size: 0.78rem;
+}
+
+.message-bubble-toast.fading {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ─── Activity waiting page ─────────────────────────────────────── */
+.activity-waiting-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 48px 32px;
+  text-align: center;
+}
+
+.activity-waiting-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.activity-waiting-badge span {
+  font-size: 0.9rem;
+  font-weight: 800;
+  color: var(--muted-strong);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.activity-type-icon.large {
+  width: 72px;
+  height: 72px;
+}
+
+.activity-type-icon.large img {
+  width: 40px;
+  height: 40px;
+}
+
+.activity-waiting-page h2 {
+  font-size: clamp(1.4rem, 3vw, 2.2rem);
+  max-width: 600px;
+}
+
+/* ─── Alarm UI ──────────────────────────────────────────────────── */
+.event-alarms-panel {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.event-alarms-panel h3 {
+  margin-bottom: 0;
+}
+
+.alarm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.alarm-time-input {
+  width: auto !important;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 8px 10px !important;
+  border-radius: 14px !important;
+  font-size: 0.9rem;
+}
+
+.alarm-song-select {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px !important;
+  border-radius: 14px !important;
+  font-size: 0.9rem;
+}
+
+/* ─── PDF render fix: ensure canvas fills container ─────────────── */
+.presentation-stage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  max-height: 68vh;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  background: var(--surface);
+  margin-inline: auto;
+  contain: layout size;
+}
+
+.presentation-stage canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
