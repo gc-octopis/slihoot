@@ -1181,7 +1181,7 @@ app.get("/healthz", async (c) => {
   );
 });
 
-app.use("/assets/*", serveStatic({ root: "./dist" }));
+app.use("/*", serveStatic({ root: "./dist" }));
 app.get("*", serveStatic({ root: "./dist", path: "index.html" }));
 
 assertRuntimeConfig();
