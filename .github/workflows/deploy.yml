@@ -39,6 +39,15 @@ jobs:
             set -euo pipefail
             cd "${DEPLOY_DIR:-/opt/slihoot}"
             git pull --ff-only
+            if ! git lfs version >/dev/null 2>&1; then
+              if command -v sudo >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y git-lfs
+              else
+                apt-get update
+                apt-get install -y git-lfs
+              fi
+            fi
             git lfs install --local
             git lfs pull
             docker compose up -d --build
