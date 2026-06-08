@@ -866,6 +866,11 @@ app.get("/api/events/:eventId/export", requireAdmin, async (c) => {
   const eventId = c.req.param("eventId")!;
   const data = await exportEventData(eventId);
   if (!data) return c.json({ error: "Event not found." }, 404);
+  const hasEndedSession = data.liveSessions.some((session) => session.status === "ended");
+  const hasOpenSession = data.liveSessions.some((session) => session.status !== "ended");
+  if (!hasEndedSession || hasOpenSession) {
+    return c.json({ error: "Only ended events with history can be exported." }, 409);
+  }
 
   const format = c.req.query("format");
   const ext = format === "csv" ? "csv" : format === "xlsx" ? "xlsx" : "json";

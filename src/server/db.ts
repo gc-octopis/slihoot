@@ -152,6 +152,7 @@ async function ensureLegacySchemaCompatibility() {
   );
 
   await addColumnIfMissing("activities", "explanation", "explanation TEXT NULL AFTER description");
+  await addColumnIfMissing("events", "alarms_json", "alarms_json JSON NULL AFTER description");
   await addColumnIfMissing(
     "activities",
     "time_limit_seconds",

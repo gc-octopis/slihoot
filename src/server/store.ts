@@ -2,6 +2,7 @@ import type {
   ActivityOption,
   ActivityRecord,
   ActivityType,
+  EventAlarmRecord,
   EventRecord,
   EventPresentationRecord,
   LeaderboardEntry,
@@ -165,6 +166,25 @@ function normalizeText(value: unknown, maxLength: number) {
   return String(value ?? "").trim().slice(0, maxLength);
 }
 
+function normalizeEventAlarms(value: unknown): EventAlarmRecord[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((alarm) => {
+      const maybeAlarm = alarm as Partial<EventAlarmRecord>;
+      const time = normalizeText(maybeAlarm.time, 5);
+      const songFile = normalizeText(maybeAlarm.songFile, 255);
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || !songFile) return null;
+      return {
+        id: normalizeText(maybeAlarm.id, 80) || id(),
+        time,
+        songFile
+      };
+    })
+    .filter((alarm): alarm is EventAlarmRecord => Boolean(alarm))
+    .slice(0, 24);
+}
+
 function normalizeOptions(type: ActivityType, options: unknown): ActivityOption[] {
   if (type === "short_answer" || type === "word_cloud") return [];
 
@@ -229,6 +249,7 @@ function rowToEvent(row: any): EventRecord {
     id: row.id,
     title: row.title,
     description: row.description ?? "",
+    alarms: parseJson<EventAlarmRecord[]>(row.alarmsJson, []),
     createdAt: toIso(row.createdAt),
     updatedAt: toIso(row.updatedAt)
   };
@@ -704,9 +725,11 @@ export async function listEvents() {
       e.id,
       e.title,
       e.description,
+      e.alarms_json AS alarmsJson,
       e.created_at AS createdAt,
       e.updated_at AS updatedAt,
       COUNT(DISTINCT a.id) AS activityCount,
+      COUNT(DISTINCT ended_ls.id) AS endedLiveSessionCount,
       active_ls.id AS activeLiveSessionId,
       active_ls.join_code AS activeLiveJoinCode,
       active_ls.status AS activeLiveStatus,
@@ -721,11 +744,13 @@ export async function listEvents() {
       ORDER BY ls.started_at DESC, ls.created_at DESC
       LIMIT 1
     )
+    LEFT JOIN live_sessions ended_ls ON ended_ls.event_id = e.id AND ended_ls.status = 'ended'
     LEFT JOIN participants p ON p.live_session_id = active_ls.id
     GROUP BY
       e.id,
       e.title,
       e.description,
+      e.alarms_json,
       e.created_at,
       e.updated_at,
       active_ls.id,
@@ -737,6 +762,7 @@ export async function listEvents() {
   return (rows as any[]).map((row) => ({
     ...rowToEvent(row),
     activityCount: Number(row.activityCount ?? 0),
+    endedLiveSessionCount: Number(row.endedLiveSessionCount ?? 0),
     activeLiveSession: row.activeLiveSessionId
       ? {
           id: row.activeLiveSessionId,
@@ -749,21 +775,25 @@ export async function listEvents() {
   }));
 }
 
-export async function createEvent(input: { title: unknown; description?: unknown }) {
+export async function createEvent(input: { title: unknown; description?: unknown; alarms?: unknown }) {
+  const alarms = normalizeEventAlarms(input.alarms);
   const event: EventRecord = {
     id: id(),
     title: normalizeText(input.title, 200) || "未命名活動",
     description: normalizeText(input.description, 2000),
+    alarms,
     createdAt: nowDate().toISOString(),
     updatedAt: nowDate().toISOString()
   };
 
   await pool.execute(
-    `INSERT INTO events (id, title, description) VALUES (:id, :title, :description)`,
+    `INSERT INTO events (id, title, description, alarms_json)
+     VALUES (:id, :title, :description, :alarmsJson)`,
     {
       id: event.id,
       title: event.title,
-      description: event.description
+      description: event.description,
+      alarmsJson: stringifyJson(alarms)
     }
   );
 
@@ -777,7 +807,8 @@ export async function getEvent(eventId: string) {
   const cached = await cacheGet(key);
   if (cached) {
     try {
-      base = JSON.parse(cached) as EventRecord;
+      const parsed = JSON.parse(cached) as EventRecord;
+      base = { ...parsed, alarms: parsed.alarms ?? [] };
     } catch {
       base = null;
     }
@@ -785,7 +816,7 @@ export async function getEvent(eventId: string) {
 
   if (!base) {
     const [rows] = await pool.execute(
-      `SELECT id, title, description, created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, title, description, alarms_json AS alarmsJson, created_at AS createdAt, updated_at AS updatedAt
        FROM events WHERE id = :eventId`,
       { eventId }
     );
@@ -809,16 +840,20 @@ export async function getEvent(eventId: string) {
 
 export async function updateEvent(
   eventId: string,
-  input: { title?: unknown; description?: unknown }
+  input: { title?: unknown; description?: unknown; alarms?: unknown }
 ) {
   const title = normalizeText(input.title, 200);
   const description = normalizeText(input.description, 2000);
+  const alarms = normalizeEventAlarms(input.alarms);
   await pool.execute(
-    `UPDATE events SET title = :title, description = :description WHERE id = :eventId`,
+    `UPDATE events
+     SET title = :title, description = :description, alarms_json = :alarmsJson
+     WHERE id = :eventId`,
     {
       eventId,
       title: title || "未命名活動",
-      description
+      description,
+      alarmsJson: stringifyJson(alarms)
     }
   );
   await cacheDel(eventKey(eventId));
@@ -1973,6 +2008,7 @@ export async function getLiveState(
       id: event.id,
       title: event.title,
       description: event.description,
+      alarms: event.alarms,
       createdAt: event.createdAt,
       updatedAt: event.updatedAt
     },

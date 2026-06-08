@@ -12,8 +12,15 @@ export interface EventRecord {
   id: string;
   title: string;
   description: string;
+  alarms: EventAlarmRecord[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface EventAlarmRecord {
+  id: string;
+  time: string;
+  songFile: string;
 }
 
 export interface ActivityOption {

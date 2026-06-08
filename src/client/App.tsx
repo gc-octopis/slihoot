@@ -42,13 +42,13 @@ import logoSmall from '/logo_small.svg?url';
 
 type EventListItem = EventRecord & {
   activityCount: number;
+  endedLiveSessionCount: number;
   activeLiveSession: ActiveLiveSessionSummary | null;
 };
 type EventDetail = EventRecord & {
   activities: ActivityRecord[];
   presentation: EventPresentationRecord | null;
   timeline: TimelineItemRecord[];
-  alarms?: AlarmRecord[];
 };
 type AlarmRecord = {
   id: string;
@@ -137,7 +137,7 @@ const ACTIVITY_TYPE_META: Record<ActivityType, { label: string; icon: string; cl
   ranking: {
     label: "排序題",
     icon: new URL(
-      "../../svgs/format_list_bulleted_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+      "../../svgs/swap_vert_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
       import.meta.url
     ).href,
     className: "type-ranking"
@@ -145,6 +145,14 @@ const ACTIVITY_TYPE_META: Record<ActivityType, { label: string; icon: string; cl
 };
 const DELETE_ICON_URL = new URL(
   "../../svgs/delete_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+  import.meta.url
+).href;
+const HIDE_ICON_URL = new URL(
+  "../../svgs/hide_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+  import.meta.url
+).href;
+const EXPORT_NOTES_ICON_URL = new URL(
+  "../../svgs/export_notes_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
   import.meta.url
 ).href;
 let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
@@ -352,7 +360,15 @@ function AdminGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-function Header({ title, actions }: { title: string; actions?: React.ReactNode }) {
+function Header({
+  title,
+  actions,
+  onBrandClick
+}: {
+  title: string;
+  actions?: React.ReactNode;
+  onBrandClick?: () => void;
+}) {
   const actionsRef = useRef<HTMLDivElement | null>(null);
   const [overflowing, setOverflowing] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -385,7 +401,7 @@ function Header({ title, actions }: { title: string; actions?: React.ReactNode }
   return (
     <>
     <header className="app-header">
-      <div className="brand" onClick={() => navigate("/")}>
+      <div className="brand" onClick={onBrandClick ?? (() => navigate("/"))}>
         <img className="logo-full" src={logo} alt="Slihoot" />
         <img className="logo-mark" src={logoSmall} alt="Slihoot" />
       </div>
@@ -587,12 +603,49 @@ function JoinPage() {
   );
 }
 
+async function downloadEventExportFile(
+  event: EventListItem,
+  format: "xlsx" | "json" | "csv",
+  token: string,
+  setError: (message: string | null) => void,
+  onDone?: () => void
+) {
+  if (event.activeLiveSession || event.endedLiveSessionCount <= 0) {
+    setError("只有曾經開始且目前已結束的活動可以匯出歷史數據。");
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/events/${event.id}/export?format=${format}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error ?? `匯出失敗（${response.status}）`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `slihoot-event-${event.id}.${format}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    onDone?.();
+  } catch (error) {
+    setError(error instanceof Error ? error.message : "匯出失敗");
+  }
+}
+
 function DashboardPage() {
   const token = getAdminToken();
   const [events, setEvents] = useState<EventListItem[]>([]);
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [exportMenuEventId, setExportMenuEventId] = useState<string | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -609,6 +662,17 @@ function DashboardPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!exportMenuEventId) return;
+    const closeOnOutsideClick = (mouseEvent: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(mouseEvent.target as Node)) {
+        setExportMenuEventId(null);
+      }
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    return () => document.removeEventListener("mousedown", closeOnOutsideClick);
+  }, [exportMenuEventId]);
 
   async function createNew(event: React.FormEvent) {
     event.preventDefault();
@@ -697,13 +761,15 @@ function DashboardPage() {
                 ) : null}
               </div>
               <div className="button-row">
-                <button onClick={() => navigate(`/admin/event/${event.id}`)}>編輯</button>
+                <button className="outline-accent" onClick={() => navigate(`/admin/event/${event.id}`)}>
+                  編輯
+                </button>
                 {event.activeLiveSession ? (
                   <>
                     <button onClick={() => navigate(`/admin/live/${event.activeLiveSession!.id}`)}>
                       回主持
                     </button>
-                    <button className="danger" onClick={() => endLive(event.activeLiveSession!.id)}>
+                    <button className="outline-danger" onClick={() => endLive(event.activeLiveSession!.id)}>
                       結束
                     </button>
                   </>
@@ -713,6 +779,70 @@ function DashboardPage() {
                 <button className="danger" onClick={() => remove(event.id)}>
                   刪除
                 </button>
+                <div
+                  className="export-menu-wrap"
+                  ref={exportMenuEventId === event.id ? exportMenuRef : undefined}
+                >
+                  <button
+                    type="button"
+                    className="icon-button card-export-button"
+                    disabled={Boolean(event.activeLiveSession) || event.endedLiveSessionCount <= 0}
+                    title={
+                      event.activeLiveSession
+                        ? "活動進行中，結束後才能匯出"
+                        : event.endedLiveSessionCount <= 0
+                          ? "活動曾經開始並結束後才能匯出"
+                          : "匯出歷史數據"
+                    }
+                    aria-label="匯出歷史數據"
+                    onClick={() =>
+                      setExportMenuEventId((current) => (current === event.id ? null : event.id))
+                    }
+                  >
+                    <img src={EXPORT_NOTES_ICON_URL} alt="" aria-hidden="true" />
+                  </button>
+                  {exportMenuEventId === event.id ? (
+                    <div className="export-menu-card" role="menu">
+                      <strong>匯出歷史數據</strong>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() =>
+                          token &&
+                          downloadEventExportFile(event, "xlsx", token, setError, () =>
+                            setExportMenuEventId(null)
+                          )
+                        }
+                      >
+                        Excel (.xlsx)
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() =>
+                          token &&
+                          downloadEventExportFile(event, "json", token, setError, () =>
+                            setExportMenuEventId(null)
+                          )
+                        }
+                      >
+                        JSON
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() =>
+                          token &&
+                          downloadEventExportFile(event, "csv", token, setError, () =>
+                            setExportMenuEventId(null)
+                          )
+                        }
+                      >
+                        CSV
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </article>
           ))}
@@ -753,6 +883,50 @@ function optionsForType(type: ActivityType, currentOptions: ActivityOption[]) {
     return currentOptions.length ? currentOptions : [draftOption("項目 A"), draftOption("項目 B")];
   }
   return currentOptions.length ? currentOptions : [draftOption("選項 A"), draftOption("選項 B")];
+}
+
+function activityToDraft(activity: ActivityRecord): ActivityDraft {
+  return {
+    type: activity.type,
+    title: activity.title,
+    description: activity.description,
+    explanation: activity.explanation,
+    hasDescription: Boolean(activity.description),
+    hasExplanation: Boolean(activity.explanation),
+    hasTimeLimit: activity.timeLimitSeconds > 0,
+    allowRepeatAnswers: activity.type === "word_cloud" ? wordCloudAllowsRepeat(activity) : false,
+    timeLimitSeconds: activity.timeLimitSeconds,
+    options: activity.options,
+    correctOptionId: correctOptionId(activity.correctAnswer),
+    correctText: correctAnswerText(activity.correctAnswer)
+  };
+}
+
+function activityDraftFingerprint(draft: ActivityDraft) {
+  return JSON.stringify({
+    type: draft.type,
+    title: draft.title,
+    description: draft.description,
+    explanation: draft.explanation,
+    hasDescription: draft.hasDescription,
+    hasExplanation: draft.hasExplanation,
+    hasTimeLimit: draft.hasTimeLimit,
+    allowRepeatAnswers: draft.allowRepeatAnswers,
+    timeLimitSeconds: draft.timeLimitSeconds,
+    options: draft.options.map((option) => ({ id: option.id, label: option.label })),
+    correctOptionId: draft.correctOptionId,
+    correctText: draft.correctText
+  });
+}
+
+function alarmsFingerprint(alarms: AlarmRecord[]) {
+  return JSON.stringify(
+    alarms.map((alarm) => ({
+      id: alarm.id,
+      time: alarm.time,
+      songFile: alarm.songFile
+    }))
+  );
 }
 
 function presentationPageSize(
@@ -917,9 +1091,11 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   const [savedEventSettings, setSavedEventSettings] = useState<{
     title: string;
     description: string;
+    alarms: string;
   } | null>(null);
   const [temporaryEventId, setTemporaryEventId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [hasPersistedEditorChange, setHasPersistedEditorChange] = useState(false);
   const [reordering, setReordering] = useState(false);
   const [uploadingPresentation, setUploadingPresentation] = useState(false);
   const [draggingTimelineItemId, setDraggingTimelineItemId] = useState<string | null>(null);
@@ -938,6 +1114,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   const creatingEventPromiseRef = useRef<Promise<EventDetail | null> | null>(null);
   const timelineDragOriginRef = useRef<EventDetail | null>(null);
   const timelineDropCommittedRef = useRef(false);
+  const activityDraftBaselineRef = useRef(activityDraftFingerprint(createDefaultActivityDraft()));
 
   const recordActivityListFlip = useCallback(() => {
     const container = activityListRef.current;
@@ -997,6 +1174,10 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     const versionParam = encodeURIComponent(`${event.presentation.id}-${event.presentation.updatedAt}`);
     return `/api/events/${event.id}/presentation/file?token=${tokenParam}&v=${versionParam}`;
   }, [event?.id, event?.presentation, token]);
+  const hasUnsavedActivityDraft =
+    activityEditorOpen && activityDraftBaselineRef.current !== activityDraftFingerprint(draft);
+  const hasEditorChanges =
+    eventSettingsChanged() || hasUnsavedActivityDraft || hasPersistedEditorChange;
 
   const load = useCallback(async (preserveCurrentSettings = false, overrideEventId?: string) => {
     if (!token) return;
@@ -1010,13 +1191,16 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           description: "",
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
+          alarms: [],
           activities: [],
           presentation: null,
           timeline: []
         });
+        setAlarms([]);
         setSavedEventSettings({
           title: "",
-          description: ""
+          description: "",
+          alarms: alarmsFingerprint([])
         });
         return;
       }
@@ -1032,9 +1216,11 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           : loaded
       );
       if (!preserveCurrentSettings) {
+        setAlarms(loaded.alarms ?? []);
         setSavedEventSettings({
           title: loaded.title,
-          description: loaded.description
+          description: loaded.description,
+          alarms: alarmsFingerprint(loaded.alarms ?? [])
         });
       }
     } catch (error) {
@@ -1045,6 +1231,16 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!hasUnsavedActivityDraft) return;
+    const warnBeforeUnload = (beforeUnloadEvent: BeforeUnloadEvent) => {
+      beforeUnloadEvent.preventDefault();
+      beforeUnloadEvent.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasUnsavedActivityDraft]);
 
   useEffect(() => {
     loadMusicJson().then((music) => {
@@ -1076,7 +1272,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       adminToken: token,
       body: {
         title: event.title,
-        description: event.description
+        description: event.description,
+        alarms
       }
     })
       .then((created) => {
@@ -1101,7 +1298,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
 
     setEditingId(null);
     setInsertAfterTimelineItemId(null);
-    setDraft(createDefaultActivityDraft());
+    const nextDraft = createDefaultActivityDraft();
+    setDraft(nextDraft);
+    activityDraftBaselineRef.current = activityDraftFingerprint(nextDraft);
     setActivityEditorOpen(true);
   }
 
@@ -1109,20 +1308,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     setEditingId(activity.id);
     setInsertAfterTimelineItemId(null);
     setActivityEditorOpen(true);
-    setDraft({
-      type: activity.type,
-      title: activity.title,
-      description: activity.description,
-      explanation: activity.explanation,
-      hasDescription: Boolean(activity.description),
-      hasExplanation: Boolean(activity.explanation),
-      hasTimeLimit: activity.timeLimitSeconds > 0,
-      allowRepeatAnswers: activity.type === "word_cloud" ? wordCloudAllowsRepeat(activity) : false,
-      timeLimitSeconds: activity.timeLimitSeconds,
-      options: activity.options,
-      correctOptionId: correctOptionId(activity.correctAnswer),
-      correctText: correctAnswerText(activity.correctAnswer)
-    });
+    const nextDraft = activityToDraft(activity);
+    setDraft(nextDraft);
+    activityDraftBaselineRef.current = activityDraftFingerprint(nextDraft);
   }
 
   function payloadFromDraft() {
@@ -1154,29 +1342,49 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   async function saveEvent(eventForm: React.FormEvent) {
     eventForm.preventDefault();
     if (!token || !event) return;
+    if (!hasEditorChanges) return;
     try {
-      const updated = event.id === NEW_EVENT_ID
-        ? await api<EventDetail>("/api/events", {
-            method: "POST",
-            adminToken: token,
-            body: {
-              title: event.title,
-              description: event.description
-            }
-          })
-        : await api<EventDetail>(`/api/events/${event.id}`, {
-            method: "PUT",
-            adminToken: token,
-            body: {
-              title: event.title,
-              description: event.description
-            }
-          });
-      setEvent(updated);
-      setSavedEventSettings({
-        title: updated.title,
-        description: updated.description
-      });
+      let activeEvent = event;
+      if (eventSettingsChanged() || event.id === NEW_EVENT_ID) {
+        const updated = event.id === NEW_EVENT_ID
+          ? await api<EventDetail>("/api/events", {
+              method: "POST",
+              adminToken: token,
+              body: {
+                title: event.title,
+                description: event.description,
+                alarms
+              }
+            })
+          : await api<EventDetail>(`/api/events/${event.id}`, {
+              method: "PUT",
+              adminToken: token,
+              body: {
+                title: event.title,
+                description: event.description,
+                alarms
+              }
+            });
+        activeEvent = updated;
+        setEvent(updated);
+        setAlarms(updated.alarms ?? []);
+        setSavedEventSettings({
+          title: updated.title,
+          description: updated.description,
+          alarms: alarmsFingerprint(updated.alarms ?? [])
+        });
+      } else if (hasUnsavedActivityDraft && event.id === NEW_EVENT_ID) {
+        const created = await ensureEventRecord();
+        if (!created) return;
+        activeEvent = created;
+      }
+
+      if (hasUnsavedActivityDraft) {
+        const savedActivity = await persistActivityDraft(activeEvent);
+        if (!savedActivity) return;
+      }
+
+      setHasPersistedEditorChange(false);
       setTemporaryEventId(null);
       navigate("/admin/dashboard");
     } catch (error) {
@@ -1188,11 +1396,18 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     if (!event || !savedEventSettings) return false;
     return (
       event.title !== savedEventSettings.title ||
-      event.description !== savedEventSettings.description
+      event.description !== savedEventSettings.description ||
+      alarmsFingerprint(alarms) !== savedEventSettings.alarms
     );
   }
 
+  function confirmDiscardUnsavedActivityDraft() {
+    if (!hasUnsavedActivityDraft) return true;
+    return confirm("題目尚未儲存。若離開，剛剛的改動不會儲存。仍要離開嗎？");
+  }
+
   async function backToDashboard() {
+    if (!confirmDiscardUnsavedActivityDraft()) return;
     const hasTemporaryEvent = isNewEvent && event?.id !== NEW_EVENT_ID;
     if ((eventSettingsChanged() || hasTemporaryEvent) && !confirm("活動尚未儲存。確定不儲存並回列表嗎？")) {
       return;
@@ -1208,15 +1423,14 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     navigate("/admin/dashboard");
   }
 
-  async function saveActivity(activityForm: React.FormEvent) {
-    activityForm.preventDefault();
-    if (!token || !event) return;
-    const activeEvent = await ensureEventRecord();
-    if (!activeEvent) return;
+  async function persistActivityDraft(activeEventOverride?: EventDetail | null) {
+    if (!token || !event) return false;
+    const activeEvent = activeEventOverride ?? (await ensureEventRecord());
+    if (!activeEvent) return false;
     // 限時開著就一定要填秒數；空白 → 提醒（要不限時請關閉「限時」拉桿，送出 0）。
     if (draft.hasTimeLimit && (!draft.timeLimitSeconds || draft.timeLimitSeconds < 1)) {
       window.alert("請輸入作答秒數，或關閉「限時」改為不限時。");
-      return;
+      return false;
     }
     try {
       if (editingId) {
@@ -1233,20 +1447,31 @@ function EventEditorPage({ eventId }: { eventId: string }) {
         });
       }
       setError(null);
-      setDraft(createDefaultActivityDraft());
+      const nextDraft = createDefaultActivityDraft();
+      setDraft(nextDraft);
+      activityDraftBaselineRef.current = activityDraftFingerprint(nextDraft);
       setEditingId(null);
       setInsertAfterTimelineItemId(null);
       setActivityEditorOpen(false);
       await load(true, activeEvent.id);
+      setHasPersistedEditorChange(true);
+      return true;
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "儲存題目失敗");
+      return false;
     }
+  }
+
+  async function saveActivity(activityForm: React.FormEvent) {
+    activityForm.preventDefault();
+    await persistActivityDraft();
   }
 
   async function removeActivity(activityId: string) {
     if (!token || !confirm("刪除此題？")) return;
     await api(`/api/activities/${activityId}`, { method: "DELETE", adminToken: token });
     await load(true);
+    setHasPersistedEditorChange(true);
   }
 
   async function uploadPresentation(file: File | null) {
@@ -1279,6 +1504,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
             }
           : (updated as EventDetail)
       );
+      setHasPersistedEditorChange(true);
     } catch (error) {
       setError(error instanceof Error ? error.message : "上傳 PDF 失敗");
     } finally {
@@ -1307,6 +1533,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
             }
           : updated
       );
+      setHasPersistedEditorChange(true);
     } catch (error) {
       setError(error instanceof Error ? error.message : "移除 PDF 失敗");
     } finally {
@@ -1324,6 +1551,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
         body: { timelineItemIds: nextTimeline.map((item) => item.id) }
       });
       setEvent((current) => (current ? { ...current, timeline: reordered } : current));
+      setHasPersistedEditorChange(true);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to reorder timeline.");
       setEvent(previousEvent);
@@ -1430,7 +1658,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
 
     setEditingId(null);
     setInsertAfterTimelineItemId(item.id);
-    setDraft(createDefaultActivityDraft());
+    const nextDraft = createDefaultActivityDraft();
+    setDraft(nextDraft);
+    activityDraftBaselineRef.current = activityDraftFingerprint(nextDraft);
     setActivityEditorOpen(true);
   }
 
@@ -1438,7 +1668,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     setActivityEditorOpen(false);
     setEditingId(null);
     setInsertAfterTimelineItemId(null);
-    setDraft(createDefaultActivityDraft());
+    const nextDraft = createDefaultActivityDraft();
+    setDraft(nextDraft);
+    activityDraftBaselineRef.current = activityDraftFingerprint(nextDraft);
   }
 
   if (!event) {
@@ -1461,9 +1693,14 @@ function EventEditorPage({ eventId }: { eventId: string }) {
             <button className="secondary" onClick={backToDashboard}>
               回列表
             </button>
-            <button form="event-settings-form">儲存活動</button>
+            <button form="event-settings-form" disabled={!hasEditorChanges}>
+              儲存活動
+            </button>
           </>
         }
+        onBrandClick={() => {
+          if (confirmDiscardUnsavedActivityDraft()) navigate("/");
+        }}
       />
       <main className="page">
         <ErrorBanner message={error} />
@@ -1526,8 +1763,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
           </div>
           {/* ─── Alarms ─────────────────────────────────── */}
           <div className="event-alarms-panel">
-            <h3>鬧鐘</h3>
-            <p className="muted" style={{fontSize:"0.82rem"}}>在直播進行中，到達指定時間自動播放鈴聲。</p>
+            <h3>鈴聲</h3>
+            <p className="muted" style={{fontSize:"0.82rem"}}>在活動進行中，到達指定時間自動播放鈴聲。</p>
             {alarms.map((alarm, i) => (
               <div key={alarm.id} className="alarm-row">
                 <input
@@ -1581,7 +1818,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
               onClick={() => setAlarms([...alarms, { id: crypto.randomUUID(), time: "09:00", songFile: bellSongs[0] ?? "" }])}
             >
               <span>+</span>
-              新增鬧鐘
+              排定鈴聲
             </button>
           </div>
         </aside>
@@ -2600,7 +2837,7 @@ function ChatPanel({
               aria-label="收合 Q&A"
               onClick={() => setIsOpen(false)}
             >
-              ×
+              <img src={HIDE_ICON_URL} alt="" aria-hidden="true" />
             </button>
           </div>
           <div className="messages">
@@ -3028,6 +3265,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   }, []);
 
   const alarmWorkerRef = useRef<Worker | null>(null);
+  const latestAlarmsRef = useRef<AlarmRecord[]>([]);
 
   // Alarm worker: set up on mount, schedule alarms from event data
   useEffect(() => {
@@ -3036,16 +3274,10 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     worker.onmessage = (e) => {
       if (e.data.type === "alarm") {
         const alarmId = e.data.id as string;
-        // Find the alarm song
-        (async () => {
-          if (!state?.event) return;
-          // alarms stored in event record (if present)
-          const alarms = (state.event as any).alarms as AlarmRecord[] | undefined;
-          const alarm = alarms?.find((a) => a.id === alarmId);
-          if (alarm?.songFile) {
-            musicPlayer.play(`/${alarm.songFile}`);
-          }
-        })();
+        const alarm = latestAlarmsRef.current.find((candidate) => candidate.id === alarmId);
+        if (alarm?.songFile) {
+          musicPlayer.play(`/${alarm.songFile}`);
+        }
       }
     };
     return () => {
@@ -3058,10 +3290,16 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   // Schedule alarms when state loads
   useEffect(() => {
     const worker = alarmWorkerRef.current;
-    if (!worker || !state?.event) return;
-    const alarms = (state.event as any).alarms as AlarmRecord[] | undefined;
-    if (!alarms?.length) return;
+    if (!worker) return;
+    if (!state?.event) {
+      latestAlarmsRef.current = [];
+      worker.postMessage({ type: "clear" });
+      return;
+    }
+    const alarms = state.event.alarms ?? [];
+    latestAlarmsRef.current = alarms;
     worker.postMessage({ type: "clear" });
+    if (!alarms.length) return;
     for (const alarm of alarms) {
       if (!alarm.time) continue;
       const [hh, mm] = alarm.time.split(":").map(Number);
@@ -3368,28 +3606,6 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     }
   }
 
-  async function downloadExport(format: "xlsx" | "json" | "csv") {
-    const eventId = state?.event.id;
-    if (!token || !eventId) return;
-    try {
-      const response = await fetch(`/api/events/${eventId}/export?format=${format}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!response.ok) throw new Error(`匯出失敗（${response.status}）`);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `slihoot-event-${eventId}.${format}`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "匯出失敗");
-    }
-  }
-
   function handleStartActivity() {
     setWaitingForActivity(null);
     socket.send("start_activity", {});
@@ -3471,6 +3687,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       </button>
       <button
         hidden={!hasCurrentActivity || isWordCloudActivity || isTimedActivity}
+        className="outline-accent"
         disabled={!socket.connected || Boolean(state?.liveSession.showResults)}
         title={
           !socket.connected
@@ -3483,17 +3700,26 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       >
         公布答案
       </button>
-      <button
+      <label
+        className="toggle-row live-name-toggle"
         hidden={!hasCurrentActivity || isWordCloudActivity}
-        disabled={!socket.connected}
-        onClick={() =>
-          socket.send("set_participant_name_visibility", {
-            showParticipantNames: !state?.liveSession.showParticipantNames
-          })
-        }
+        title="切換記名明細"
       >
-        {state?.liveSession.showParticipantNames ? "匿名明細" : "記名明細"}
-      </button>
+        <span>
+          <span>記名明細</span>
+          <small>{state?.liveSession.showParticipantNames ? "目前顯示記名" : "目前顯示匿名"}</small>
+        </span>
+        <input
+          type="checkbox"
+          disabled={!socket.connected}
+          checked={Boolean(state?.liveSession.showParticipantNames)}
+          onChange={() =>
+            socket.send("set_participant_name_visibility", {
+              showParticipantNames: !state?.liveSession.showParticipantNames
+            })
+          }
+        />
+      </label>
       {hasCurrentActivity ? (
         <button
           className="secondary"
@@ -3503,7 +3729,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           重置
         </button>
       ) : null}
-      <button className="danger" onClick={endLive}>
+      <button className="outline-danger" onClick={endLive}>
         結束
       </button>
     </div>
@@ -3661,21 +3887,6 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </section>
           ) : null}
           <Leaderboard entries={state?.leaderboard} />
-          <section className="results-panel">
-            <h2>匯出歷史數據</h2>
-            <div className="button-row">
-              <button type="button" onClick={() => downloadExport("xlsx")}>
-                匯出 Excel
-              </button>
-              <button type="button" className="secondary" onClick={() => downloadExport("json")}>
-                匯出 JSON
-              </button>
-              <button type="button" className="secondary" onClick={() => downloadExport("csv")}>
-                匯出 CSV
-              </button>
-            </div>
-            <p className="muted">包含這個活動所有場次的作答紀錄、答對與分數。</p>
-          </section>
         </section>
 
         {/* Bubble toasts (non-fullscreen) */}

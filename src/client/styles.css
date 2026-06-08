@@ -115,6 +115,30 @@ button.danger:hover {
   background: var(--danger-strong);
 }
 
+button.outline-accent {
+  border: 1.5px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+}
+
+button.outline-accent:hover,
+button.outline-accent:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+button.outline-danger {
+  border: 1.5px solid var(--danger);
+  background: transparent;
+  color: var(--danger);
+}
+
+button.outline-danger:hover,
+button.outline-danger:focus-visible {
+  background: var(--danger-bg);
+  color: var(--danger-strong);
+}
+
 input,
 textarea,
 select {
@@ -410,6 +434,69 @@ small {
   font-size: 0.98rem;
 }
 
+.export-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.card-export-button,
+.card-export-button:hover,
+.card-export-button:active,
+.card-export-button:disabled {
+  background: transparent;
+  color: #3f3f46;
+  transform: none;
+}
+
+.card-export-button img {
+  width: 22px;
+  height: 22px;
+  display: block;
+  filter: brightness(0) saturate(100%);
+  opacity: 0.68;
+}
+
+.card-export-button:not(:disabled):hover img {
+  opacity: 0.86;
+}
+
+.export-menu-card {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 20;
+  display: grid;
+  min-width: 176px;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+}
+
+.export-menu-card strong {
+  color: var(--ink);
+}
+
+.export-menu-card small {
+  color: var(--muted);
+}
+
+.export-menu-card button {
+  width: 100%;
+  min-height: 34px;
+  justify-content: center;
+  padding: 0 12px;
+  background: #efe8f7;
+  color: var(--accent);
+  font-size: 0.84rem;
+}
+
+.export-menu-card button:hover {
+  background: #e5dcf2;
+  color: var(--accent-strong);
+}
+
 .icon-text-button span {
   display: inline-grid;
   place-items: center;
@@ -444,7 +531,7 @@ small {
   border: 0;
   border-radius: 0;
   background: transparent;
-  padding: 0;
+  padding: 0 12px;
 }
 
 .event-fields {
@@ -731,6 +818,15 @@ small {
   justify-content: space-between;
   gap: 12px;
   color: var(--ink);
+}
+
+.live-name-toggle {
+  margin-left: auto;
+  min-width: 0;
+}
+
+.live-name-toggle span {
+  min-width: 0;
 }
 
 .compact-toggle {
@@ -1046,7 +1142,7 @@ small {
 }
 
 .activity-type-icon.type-ranking {
-  background: #f0e8ff;
+  background: #ffe8ea;
 }
 
 .timeline-insert-slot {
@@ -1316,6 +1412,13 @@ small {
 .chat-close-button:hover {
   background: #e5dcf2;
   color: var(--accent-strong);
+}
+
+.chat-close-button img {
+  width: 20px;
+  height: 20px;
+  display: block;
+  filter: none;
 }
 
 .messages {
