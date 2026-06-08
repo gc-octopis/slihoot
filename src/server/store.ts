@@ -11,6 +11,8 @@ import type {
   LiveState,
   MessageStatus,
   ParticipantRecord,
+  QuickResponseEntryRecord,
+  QuickResponseState,
   ResponseRecord,
   ResponseSummary,
   TimelineItemRecord
@@ -23,6 +25,7 @@ const activityTypes: ActivityType[] = [
   "true_false",
   "short_answer",
   "word_cloud",
+  "poll",
   "ranking"
 ];
 
@@ -166,6 +169,10 @@ function normalizeText(value: unknown, maxLength: number) {
   return String(value ?? "").trim().slice(0, maxLength);
 }
 
+function isNonQuizActivity(activity: Pick<ActivityRecord, "type"> | null | undefined) {
+  return activity?.type === "word_cloud" || activity?.type === "poll";
+}
+
 function normalizeEventAlarms(value: unknown): EventAlarmRecord[] {
   if (!Array.isArray(value)) return [];
 
@@ -222,6 +229,10 @@ function normalizeCorrectAnswer(
 
   if (type === "word_cloud") {
     return { allowRepeatAnswers: Boolean(answerObject.allowRepeatAnswers) };
+  }
+
+  if (type === "poll") {
+    return null;
   }
 
   if (type === "short_answer") {
@@ -337,6 +348,7 @@ function rowToLiveSession(row: any): LiveSessionRecord {
     currentActivityIndex: Number(row.currentActivityIndex ?? 0),
     currentActivityStartedAt: row.currentActivityStartedAt ? toIso(row.currentActivityStartedAt) : null,
     completedActivityIds: parseJson<string[]>(row.completedActivityIds, []),
+    noScoreActivityIds: parseJson<string[]>(row.noScoreActivityIds, []),
     showResults: Boolean(row.showResults),
     showParticipantNames: Boolean(row.showParticipantNames),
     startedAt: row.startedAt ? toIso(row.startedAt) : null,
@@ -925,12 +937,12 @@ export async function createActivity(
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
-  if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
-    throw new Error("Multiple choice and ranking activities need at least two options.");
+  if ((type === "multiple_choice" || type === "ranking" || type === "poll") && options.length < 2) {
+    throw new Error("Multiple choice, poll, and ranking activities need at least two options.");
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
-  if (type !== "word_cloud" && !correctAnswer) {
+  if (type !== "word_cloud" && type !== "poll" && !correctAnswer) {
     throw new Error("請先設定正確答案再新增題目。");
   }
 
@@ -1035,12 +1047,12 @@ export async function updateActivity(
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
   const options = normalizeOptions(type, input.options);
 
-  if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
-    throw new Error("Multiple choice and ranking activities need at least two options.");
+  if ((type === "multiple_choice" || type === "ranking" || type === "poll") && options.length < 2) {
+    throw new Error("Multiple choice, poll, and ranking activities need at least two options.");
   }
 
   const correctAnswer = normalizeCorrectAnswer(type, options, input.correctAnswer);
-  if (type !== "word_cloud" && !correctAnswer) {
+  if (type !== "word_cloud" && type !== "poll" && !correctAnswer) {
     throw new Error("請先設定正確答案再儲存題目。");
   }
 
@@ -1205,7 +1217,7 @@ export async function startLiveSession(eventId: string) {
     `INSERT INTO live_sessions
       (id, event_id, join_code, status, current_timeline_item_id, current_timeline_index, current_activity_id, current_activity_index, current_activity_started_at, show_results, started_at)
      VALUES
-      (:id, :eventId, :joinCode, 'active', :currentTimelineItemId, 0, :currentActivityId, :currentActivityIndex, :currentActivityStartedAt, FALSE, :startedAt)`,
+      (:id, :eventId, :joinCode, 'active', :currentTimelineItemId, 0, :currentActivityId, :currentActivityIndex, :currentActivityStartedAt, :showResults, :startedAt)`,
     {
       id: liveId,
       eventId,
@@ -1215,7 +1227,8 @@ export async function startLiveSession(eventId: string) {
       currentActivityIndex: firstActivity
         ? activities.findIndex((activity) => activity.id === firstActivity.id)
         : 0,
-      currentActivityStartedAt: null,
+      currentActivityStartedAt: firstActivity && firstActivity.timeLimitSeconds <= 0 ? nowDate() : null,
+      showResults: isNonQuizActivity(firstActivity),
       startedAt: nowDate()
     }
   );
@@ -1236,6 +1249,7 @@ export async function getLiveSession(liveId: string) {
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
       completed_activity_ids AS completedActivityIds,
+      no_score_activity_ids AS noScoreActivityIds,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -1276,18 +1290,31 @@ export async function setCurrentTimelineItem(liveId: string, timelineItemId: str
     throw new Error("Activity does not belong to this live session.");
   }
 
+  const nextActivity = activityId
+    ? activities.find((activity) => activity.id === activityId) ?? null
+    : null;
+  const previousActivity = liveSession.currentActivityId
+    ? activities.find((activity) => activity.id === liveSession.currentActivityId) ?? null
+    : null;
   const completed = new Set(liveSession.completedActivityIds);
   if (
-    liveSession.currentActivityId &&
+    previousActivity &&
+    !isNonQuizActivity(previousActivity) &&
+    previousActivity.timeLimitSeconds > 0 &&
     liveSession.currentActivityId !== activityId &&
     liveSession.currentActivityStartedAt
   ) {
-    completed.add(liveSession.currentActivityId);
+    completed.add(previousActivity.id);
+  }
+  if (nextActivity && (nextActivity.timeLimitSeconds === 0 || isNonQuizActivity(nextActivity))) {
+    completed.delete(nextActivity.id);
   }
 
-  // A question that has already been answered must not re-arm its timer when
-  // revisited. Keep it open but anchored in the past so it stays revealed/closed.
-  const startedAt = activityId ? (completed.has(activityId) ? new Date(0) : nowDate()) : null;
+  const startedAt = nextActivity
+    ? nextActivity.timeLimitSeconds > 0
+      ? null
+      : nowDate()
+    : null;
 
   await pool.execute(
     `UPDATE live_sessions
@@ -1296,7 +1323,7 @@ export async function setCurrentTimelineItem(liveId: string, timelineItemId: str
          current_activity_id = :activityId,
          current_activity_index = :activityIndex,
          current_activity_started_at = :startedAt,
-         show_results = FALSE,
+         show_results = :showResults,
          completed_activity_ids = :completedActivityIds
      WHERE id = :liveId`,
     {
@@ -1306,6 +1333,7 @@ export async function setCurrentTimelineItem(liveId: string, timelineItemId: str
       activityId,
       activityIndex,
       startedAt,
+      showResults: isNonQuizActivity(nextActivity),
       completedActivityIds: stringifyJson(Array.from(completed))
     }
   );
@@ -1330,14 +1358,60 @@ export async function startActivity(liveId: string) {
   if (!liveSession || liveSession.status === "ended" || !liveSession.currentActivityId) {
     return liveSession;
   }
+  if (liveSession.completedActivityIds.includes(liveSession.currentActivityId)) {
+    return liveSession;
+  }
+  const activity = await getActivity(liveSession.currentActivityId);
 
   await pool.execute(
     `UPDATE live_sessions
      SET current_activity_started_at = :startedAt,
-         show_results = FALSE
+         show_results = :showResults
      WHERE id = :liveId`,
-    { liveId, startedAt: nowDate() }
+    { liveId, startedAt: nowDate(), showResults: isNonQuizActivity(activity) }
   );
+
+  return getLiveSession(liveId);
+}
+
+export async function resetCurrentActivity(liveId: string) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession || liveSession.status === "ended" || !liveSession.currentActivityId) {
+    return liveSession;
+  }
+
+  const activity = await getActivity(liveSession.currentActivityId);
+  if (!activity) return liveSession;
+
+  const completed = new Set(liveSession.completedActivityIds);
+  completed.delete(activity.id);
+  const noScore = new Set(liveSession.noScoreActivityIds);
+  noScore.delete(activity.id);
+
+  await pool.execute(
+    `DELETE FROM responses
+     WHERE live_session_id = :liveId
+       AND activity_id = :activityId`,
+    { liveId, activityId: activity.id }
+  );
+
+  await pool.execute(
+    `UPDATE live_sessions
+     SET current_activity_started_at = :startedAt,
+         show_results = :showResults,
+         completed_activity_ids = :completedActivityIds,
+         no_score_activity_ids = :noScoreActivityIds
+     WHERE id = :liveId`,
+    {
+      liveId,
+      startedAt: activity.timeLimitSeconds > 0 ? null : nowDate(),
+      showResults: isNonQuizActivity(activity),
+      completedActivityIds: stringifyJson(Array.from(completed)),
+      noScoreActivityIds: stringifyJson(Array.from(noScore))
+    }
+  );
+
+  await cacheDel(...summaryKeysFor(liveId, activity.id), leaderboardKey(liveId));
 
   return getLiveSession(liveId);
 }
@@ -1345,12 +1419,13 @@ export async function startActivity(liveId: string) {
 export async function setResultsVisibility(liveId: string, showResults: boolean) {
   const liveSession = await getLiveSession(liveId);
   if (!liveSession) return null;
+  const activity = liveSession.currentActivityId ? await getActivity(liveSession.currentActivityId) : null;
 
   // Revealing results closes answering for the current question, and that lock
   // is terminal: toggling results back off hides the display but does not
   // re-open submissions. (Timed questions close on time-up instead.)
   const completed = new Set(liveSession.completedActivityIds);
-  if (showResults && liveSession.currentActivityId) {
+  if (showResults && liveSession.currentActivityId && !isNonQuizActivity(activity)) {
     completed.add(liveSession.currentActivityId);
   }
 
@@ -1365,6 +1440,36 @@ export async function setResultsVisibility(liveId: string, showResults: boolean)
       completedActivityIds: stringifyJson(Array.from(completed))
     }
   );
+  return getLiveSession(liveId);
+}
+
+export async function continueAcceptingAnswers(liveId: string) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession || liveSession.status === "ended" || !liveSession.currentActivityId) {
+    return liveSession;
+  }
+
+  const activity = await getActivity(liveSession.currentActivityId);
+  if (!activity || isNonQuizActivity(activity)) return liveSession;
+
+  const completed = new Set(liveSession.completedActivityIds);
+  completed.delete(activity.id);
+  const noScore = new Set(liveSession.noScoreActivityIds);
+  noScore.add(activity.id);
+
+  await pool.execute(
+    `UPDATE live_sessions
+     SET show_results = FALSE,
+         completed_activity_ids = :completedActivityIds,
+         no_score_activity_ids = :noScoreActivityIds
+     WHERE id = :liveId`,
+    {
+      liveId,
+      completedActivityIds: stringifyJson(Array.from(completed)),
+      noScoreActivityIds: stringifyJson(Array.from(noScore))
+    }
+  );
+
   return getLiveSession(liveId);
 }
 
@@ -1391,6 +1496,7 @@ export async function joinLiveSession(input: { joinCode: unknown; nickname: unkn
       current_activity_index AS currentActivityIndex,
       current_activity_started_at AS currentActivityStartedAt,
       completed_activity_ids AS completedActivityIds,
+      no_score_activity_ids AS noScoreActivityIds,
       show_results AS showResults,
       show_participant_names AS showParticipantNames,
       started_at AS startedAt,
@@ -1586,18 +1692,16 @@ export async function submitAnswer(input: {
   // message can't slip an answer in after the reveal.
   const startedMs = new Date(liveSession.currentActivityStartedAt).getTime();
   const answeringClosed =
-    liveSession.completedActivityIds.includes(input.activityId) ||
-    (activity.timeLimitSeconds > 0
-      ? Date.now() - startedMs >= activity.timeLimitSeconds * 1000
-      : liveSession.showResults);
+    !isNonQuizActivity(activity) &&
+    (liveSession.completedActivityIds.includes(input.activityId) ||
+      (activity.timeLimitSeconds > 0
+        ? Date.now() - startedMs >= activity.timeLimitSeconds * 1000
+        : liveSession.showResults));
   if (answeringClosed) {
     throw new Error("這一題已結束作答。");
   }
 
   const existingResponse = await getResponse(input.liveId, input.activityId, input.participantId);
-  if (activity.type === "word_cloud" && existingResponse && !activity.allowRepeatAnswers) {
-    throw new Error("這一題不開放重複填答。");
-  }
 
   const answer = validateAnswer(activity, input.answer);
   const responseId = id();
@@ -1607,7 +1711,7 @@ export async function submitAnswer(input: {
       ? {
           texts: [
             ...extractWordCloudTexts(
-              activity.allowRepeatAnswers ? existingResponse?.answer : null
+              existingResponse?.answer
             ),
             answer.text
           ]
@@ -1636,7 +1740,10 @@ export async function submitAnswer(input: {
     );
     correctRank = Number((rankRows as any[])[0]?.earlierCorrect ?? 0) + 1;
   }
-  const score = computeScore(isCorrect, elapsedMs, activity.timeLimitSeconds, correctRank);
+  const score =
+    isNonQuizActivity(activity) || liveSession.noScoreActivityIds.includes(activity.id)
+      ? 0
+      : computeScore(isCorrect, elapsedMs, activity.timeLimitSeconds, correctRank);
 
   await pool.execute(
     `INSERT INTO responses
@@ -1930,6 +2037,165 @@ export async function getLeaderboard(liveId: string): Promise<LeaderboardEntry[]
   return entries;
 }
 
+function rowToQuickResponseEntry(row: any): QuickResponseEntryRecord {
+  return {
+    id: String(row.id),
+    runId: String(row.runId),
+    liveSessionId: String(row.liveSessionId),
+    participantId: String(row.participantId),
+    participantName: String(row.participantName ?? ""),
+    rank: Number(row.rankOrder ?? 0),
+    clickedAt: toIso(row.clickedAt)
+  };
+}
+
+export async function getQuickResponseState(
+  liveId: string,
+  participantId?: string
+): Promise<QuickResponseState | null> {
+  const [runRows] = await pool.execute(
+    `SELECT
+      id,
+      live_session_id AS liveSessionId,
+      status,
+      started_at AS startedAt,
+      closed_at AS closedAt,
+      created_at AS createdAt
+    FROM quick_response_runs
+    WHERE live_session_id = :liveId
+    ORDER BY
+      CASE status WHEN 'waiting' THEN 0 WHEN 'open' THEN 0 ELSE 1 END,
+      created_at DESC
+    LIMIT 1`,
+    { liveId }
+  );
+  const run = (runRows as any[])[0];
+  if (!run) return null;
+
+  const [entryRows] = await pool.execute(
+    `SELECT
+      e.id,
+      e.run_id AS runId,
+      e.live_session_id AS liveSessionId,
+      e.participant_id AS participantId,
+      p.nickname AS participantName,
+      e.rank_order AS rankOrder,
+      e.clicked_at AS clickedAt
+    FROM quick_response_entries e
+    INNER JOIN participants p ON p.id = e.participant_id
+    WHERE e.run_id = :runId
+    ORDER BY e.rank_order ASC`,
+    { runId: run.id }
+  );
+  const entries = (entryRows as any[]).map(rowToQuickResponseEntry);
+
+  return {
+    id: String(run.id),
+    liveSessionId: String(run.liveSessionId),
+    status: run.status,
+    startedAt: run.startedAt ? toIso(run.startedAt) : null,
+    closedAt: run.closedAt ? toIso(run.closedAt) : null,
+    createdAt: toIso(run.createdAt),
+    entries,
+    myEntry: participantId
+      ? entries.find((entry) => entry.participantId === participantId) ?? null
+      : undefined
+  };
+}
+
+export async function prepareQuickResponse(liveId: string) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession || liveSession.status === "ended") return null;
+
+  await pool.execute(
+    `UPDATE quick_response_runs
+     SET status = 'closed', closed_at = COALESCE(closed_at, :closedAt)
+     WHERE live_session_id = :liveId AND status <> 'closed'`,
+    { liveId, closedAt: nowDate() }
+  );
+
+  const runId = id();
+  await pool.execute(
+    `INSERT INTO quick_response_runs (id, live_session_id, status)
+     VALUES (:id, :liveId, 'waiting')`,
+    { id: runId, liveId }
+  );
+
+  return getQuickResponseState(liveId);
+}
+
+export async function openQuickResponse(liveId: string) {
+  const state = await getQuickResponseState(liveId);
+  if (!state || state.status === "closed") return state;
+
+  await pool.execute(
+    `UPDATE quick_response_runs
+     SET status = 'open', started_at = COALESCE(started_at, :startedAt)
+     WHERE id = :runId AND live_session_id = :liveId`,
+    { liveId, runId: state.id, startedAt: nowDate() }
+  );
+
+  return getQuickResponseState(liveId);
+}
+
+export async function closeQuickResponse(liveId: string) {
+  const state = await getQuickResponseState(liveId);
+  if (!state) return null;
+
+  await pool.execute(
+    `UPDATE quick_response_runs
+     SET status = 'closed', closed_at = COALESCE(closed_at, :closedAt)
+     WHERE id = :runId AND live_session_id = :liveId`,
+    { liveId, runId: state.id, closedAt: nowDate() }
+  );
+
+  return getQuickResponseState(liveId);
+}
+
+export async function submitQuickResponse(liveId: string, participantId: string) {
+  const state = await getQuickResponseState(liveId, participantId);
+  if (!state || state.status !== "open") {
+    throw new Error("目前沒有開放搶答。");
+  }
+  if (state.myEntry) return state.myEntry;
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rankRows] = await connection.execute(
+      `SELECT COALESCE(MAX(rank_order), 0) + 1 AS nextRank
+       FROM quick_response_entries
+       WHERE run_id = :runId
+       FOR UPDATE`,
+      { runId: state.id }
+    );
+    const rank = Number((rankRows as any[])[0]?.nextRank ?? 1);
+    await connection.execute(
+      `INSERT IGNORE INTO quick_response_entries
+        (id, run_id, live_session_id, participant_id, rank_order, clicked_at)
+       VALUES
+        (:id, :runId, :liveId, :participantId, :rank, :clickedAt)`,
+      {
+        id: id(),
+        runId: state.id,
+        liveId,
+        participantId,
+        rank,
+        clickedAt: nowDate()
+      }
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  const nextState = await getQuickResponseState(liveId, participantId);
+  return nextState?.myEntry ?? null;
+}
+
 export async function getLiveState(
   liveId: string,
   viewer: "admin" | "participant",
@@ -1961,10 +2227,13 @@ export async function getLiveState(
     currentActivity && liveSession.status !== "ended" && liveSession.currentActivityStartedAt
   );
   const answerClosed = Boolean(
-    currentActivity && liveSession.completedActivityIds.includes(currentActivity.id)
+    currentActivity &&
+      !isNonQuizActivity(currentActivity) &&
+      liveSession.completedActivityIds.includes(currentActivity.id)
   );
   const timeExpired = Boolean(
     currentActivity &&
+      !isNonQuizActivity(currentActivity) &&
       currentActivity.timeLimitSeconds > 0 &&
       liveSession.currentActivityStartedAt &&
       Date.now() - new Date(liveSession.currentActivityStartedAt).getTime() >=
@@ -1972,11 +2241,13 @@ export async function getLiveState(
   );
   const answerRevealed = Boolean(
     currentActivity &&
-      (answerClosed || timeExpired || (liveSession.showResults && currentActivity.timeLimitSeconds <= 0))
+      (isNonQuizActivity(currentActivity)
+        ? liveSession.showResults
+        : timeExpired || liveSession.showResults)
   );
 
   const responseSummary =
-    currentActivity && (viewer === "admin" || answerRevealed)
+    currentActivity && (viewer === "admin" || answerRevealed || isNonQuizActivity(currentActivity))
       ? await getResponseSummary(liveId, currentActivity, {
           includeResponses: viewer === "admin",
           includeParticipantNames: viewer === "admin" && liveSession.showParticipantNames
@@ -1998,6 +2269,7 @@ export async function getLiveState(
         : publicActivity(currentActivity);
 
   const fullLeaderboard = await getLeaderboard(liveId);
+  const quickResponse = await getQuickResponseState(liveId, participantId);
   const myEntry = participantId
     ? fullLeaderboard.find((entry) => entry.participantId === participantId)
     : undefined;
@@ -2023,7 +2295,8 @@ export async function getLiveState(
     answerRevealed,
     answerClosed,
     activityOpen,
-    leaderboard: fullLeaderboard.slice(0, 10),
+    quickResponse,
+    leaderboard: fullLeaderboard,
     myScore: participantId ? (myEntry?.score ?? 0) : undefined,
     myRank: participantId ? (myEntry?.rank ?? null) : undefined,
     me: participantId ? await getParticipant(participantId) : undefined,
@@ -2223,6 +2496,17 @@ export interface EventExport {
     score: number;
     receivedAt: string;
   }>;
+  quickResponses: Array<{
+    liveSessionId: string;
+    joinCode: string;
+    runId: string;
+    runNumber: number;
+    status: string;
+    participantId: string;
+    nickname: string;
+    rank: number;
+    clickedAt: string;
+  }>;
 }
 
 // Gather everything recorded for an event (its questions and every answer
@@ -2281,6 +2565,41 @@ export async function exportEventData(eventId: string): Promise<EventExport | nu
     };
   });
 
+  const [quickRows] = await pool.execute(
+    `SELECT
+      qr.live_session_id AS liveSessionId,
+      ls.join_code AS joinCode,
+      qr.id AS runId,
+      qr.status AS status,
+      qe.participant_id AS participantId,
+      p.nickname AS nickname,
+      qe.rank_order AS rankOrder,
+      qe.clicked_at AS clickedAt
+    FROM quick_response_runs qr
+    INNER JOIN live_sessions ls ON ls.id = qr.live_session_id
+    INNER JOIN quick_response_entries qe ON qe.run_id = qr.id
+    INNER JOIN participants p ON p.id = qe.participant_id
+    WHERE ls.event_id = :eventId
+    ORDER BY ls.created_at ASC, qr.created_at ASC, qe.rank_order ASC`,
+    { eventId }
+  );
+  const runNumberById = new Map<string, number>();
+  const quickResponses = (quickRows as any[]).map((row) => {
+    const runId = String(row.runId);
+    if (!runNumberById.has(runId)) runNumberById.set(runId, runNumberById.size + 1);
+    return {
+      liveSessionId: String(row.liveSessionId),
+      joinCode: String(row.joinCode),
+      runId,
+      runNumber: runNumberById.get(runId) ?? 0,
+      status: String(row.status),
+      participantId: String(row.participantId),
+      nickname: String(row.nickname),
+      rank: Number(row.rankOrder) || 0,
+      clickedAt: toIso(row.clickedAt)
+    };
+  });
+
   return {
     exportedAt: new Date().toISOString(),
     event: { id: event.id, title: event.title, description: event.description },
@@ -2300,6 +2619,7 @@ export async function exportEventData(eventId: string): Promise<EventExport | nu
       startedAt: row.startedAt ? toIso(row.startedAt) : null,
       endedAt: row.endedAt ? toIso(row.endedAt) : null
     })),
-    responses
+    responses,
+    quickResponses
   };
 }

@@ -26,6 +26,7 @@ import {
 } from "./auth";
 import {
   authenticateParticipant,
+  closeQuickResponse,
   countParticipants,
   createActivity,
   createEvent,
@@ -45,16 +46,21 @@ import {
   listEvents,
   listMessages,
   moderateMessage,
+  openQuickResponse,
   PRESENCE_TTL_SECONDS,
+  prepareQuickResponse,
   reorderActivities,
   reorderTimelineItems,
+  resetCurrentActivity,
   saveEventPresentation,
   setCurrentActivity,
   setCurrentTimelineItem,
   startActivity,
   setParticipantNameVisibility,
   setResultsVisibility,
+  continueAcceptingAnswers,
   startLiveSession,
+  submitQuickResponse,
   submitAnswer,
   touchParticipant,
   updateActivity,
@@ -573,12 +579,49 @@ async function handleSocketMessage(client: SocketClient, message: SocketMessage)
       return;
     }
 
+    case "continue_accepting_answers": {
+      if (client.role !== "admin") throw new Error("Only admin can reopen answers.");
+      await continueAcceptingAnswers(client.liveId);
+      await broadcastState(client.liveId);
+      return;
+    }
+
     case "set_participant_name_visibility": {
       if (client.role !== "admin") {
         throw new Error("Only admin can set participant name visibility.");
       }
       const payload = message.payload as any;
       await setParticipantNameVisibility(client.liveId, Boolean(payload.showParticipantNames));
+      await broadcastState(client.liveId);
+      return;
+    }
+
+    case "prepare_quick_response": {
+      if (client.role !== "admin") throw new Error("Only admin can start quick response.");
+      await prepareQuickResponse(client.liveId);
+      await broadcastState(client.liveId);
+      return;
+    }
+
+    case "open_quick_response": {
+      if (client.role !== "admin") throw new Error("Only admin can open quick response.");
+      await openQuickResponse(client.liveId);
+      await broadcastState(client.liveId);
+      return;
+    }
+
+    case "close_quick_response": {
+      if (client.role !== "admin") throw new Error("Only admin can close quick response.");
+      await closeQuickResponse(client.liveId);
+      await broadcastState(client.liveId);
+      return;
+    }
+
+    case "submit_quick_response": {
+      if (client.role !== "participant" || !client.participantId) {
+        throw new Error("Only participants can buzz in.");
+      }
+      await submitQuickResponse(client.liveId, client.participantId);
       await broadcastState(client.liveId);
       return;
     }
@@ -709,6 +752,23 @@ function exportToCsv(data: Awaited<ReturnType<typeof exportEventData>>): string 
         .join(",")
     );
   }
+  for (const row of data.quickResponses) {
+    lines.push(
+      [
+        row.joinCode,
+        "",
+        `搶答 #${row.runNumber}`,
+        "quick_response",
+        row.nickname,
+        `第 ${row.rank} 名`,
+        "",
+        0,
+        row.clickedAt
+      ]
+        .map(cell)
+        .join(",")
+    );
+  }
   return "﻿" + lines.join("\r\n");
 }
 
@@ -732,6 +792,14 @@ function exportToXlsx(data: NonNullable<Awaited<ReturnType<typeof exportEventDat
     題型: activity.type,
     秒數: activity.timeLimitSeconds
   }));
+  const quickResponseRows = data.quickResponses.map((row) => ({
+    場次代碼: row.joinCode,
+    搶答輪次: row.runNumber,
+    狀態: row.status,
+    參與者: row.nickname,
+    名次: row.rank,
+    搶答時間: row.clickedAt
+  }));
 
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(
@@ -740,6 +808,15 @@ function exportToXlsx(data: NonNullable<Awaited<ReturnType<typeof exportEventDat
     "作答紀錄"
   );
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(activityRows), "題目");
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.json_to_sheet(
+      quickResponseRows.length
+        ? quickResponseRows
+        : [{ 場次代碼: "", 搶答輪次: "", 狀態: "", 參與者: "", 名次: "", 搶答時間: "" }]
+    ),
+    "搶答紀錄"
+  );
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Uint8Array;
 }
 
@@ -1052,6 +1129,16 @@ app.post("/api/live-sessions/:liveId/end", requireAdmin, async (c) =>
     const liveId = c.req.param("liveId")!;
     const liveSession = await endLiveSession(liveId);
     await broadcastState(liveId);
+    return liveSession;
+  })
+);
+
+app.post("/api/live-sessions/:liveId/reset-activity", requireAdmin, async (c) =>
+  routeJson(c, async () => {
+    const liveId = c.req.param("liveId")!;
+    const liveSession = await resetCurrentActivity(liveId);
+    await broadcastState(liveId);
+    await scheduleReveal(liveId);
     return liveSession;
   })
 );

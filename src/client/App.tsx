@@ -134,6 +134,14 @@ const ACTIVITY_TYPE_META: Record<ActivityType, { label: string; icon: string; cl
       .href,
     className: "type-word-cloud"
   },
+  poll: {
+    label: "投票",
+    icon: new URL(
+      "../../svgs/format_list_bulleted_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+      import.meta.url
+    ).href,
+    className: "type-poll"
+  },
   ranking: {
     label: "排序題",
     icon: new URL(
@@ -967,6 +975,39 @@ function wordCloudAllowsRepeat(activity: ActivityRecord) {
   return Boolean((activity.correctAnswer as { allowRepeatAnswers?: unknown }).allowRepeatAnswers);
 }
 
+function isNonQuizActivity(activity: Pick<ActivityRecord, "type"> | null | undefined) {
+  return activity?.type === "word_cloud" || activity?.type === "poll";
+}
+
+function canvasHasVisiblePixels(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number
+) {
+  const sampleSize = 14;
+  const points = [
+    [0.08, 0.08],
+    [0.5, 0.08],
+    [0.92, 0.08],
+    [0.08, 0.5],
+    [0.5, 0.5],
+    [0.92, 0.5],
+    [0.08, 0.92],
+    [0.5, 0.92],
+    [0.92, 0.92]
+  ];
+
+  return points.some(([xRatio, yRatio]) => {
+    const x = Math.max(0, Math.min(width - sampleSize, Math.floor(width * xRatio)));
+    const y = Math.max(0, Math.min(height - sampleSize, Math.floor(height * yRatio)));
+    const imageData = context.getImageData(x, y, Math.min(sampleSize, width), Math.min(sampleSize, height));
+    for (let index = 3; index < imageData.data.length; index += 4) {
+      if (imageData.data[index] !== 0) return true;
+    }
+    return false;
+  });
+}
+
 function PdfCanvasPage({
   url,
   pageNumber,
@@ -1028,38 +1069,54 @@ function PdfCanvasPage({
           containerSize.height / baseViewport.height
         );
         const viewport = page.getViewport({ scale: Number.isFinite(scale) && scale > 0 ? scale : 1 });
-        const outputScale = window.devicePixelRatio || 1;
-        const context = targetCanvas.getContext("2d");
+        const outputScale = Math.min(window.devicePixelRatio || 1, 1.5);
+        const renderCanvas = document.createElement("canvas");
+        const context = renderCanvas.getContext("2d", { willReadFrequently: true });
         if (!context) throw new Error("Canvas is not available.");
         if (cancelled) return;
 
-        targetCanvas.width = Math.floor(viewport.width * outputScale);
-        targetCanvas.height = Math.floor(viewport.height * outputScale);
-        targetCanvas.style.width = `${viewport.width}px`;
-        targetCanvas.style.height = `${viewport.height}px`;
+        renderCanvas.width = Math.floor(viewport.width * outputScale);
+        renderCanvas.height = Math.floor(viewport.height * outputScale);
 
         context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
         context.clearRect(0, 0, viewport.width, viewport.height);
 
-        renderTask = page.render({
-          canvasContext: context,
-          viewport
-        });
-        await renderTask.promise;
-        // Verify the canvas actually has non-zero pixel data (detect blank renders)
-        if (cancelled) return;
-        const imageData = context.getImageData(0, 0, Math.min(10, targetCanvas.width), Math.min(10, targetCanvas.height));
-        const hasContent = imageData.data.some((v) => v !== 0);
-        if (!hasContent && !cancelled) {
-          // Retry once after a short delay
-          await new Promise((r) => window.setTimeout(r, 120));
+        let copiedToVisibleCanvas = false;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (attempt > 0) await new Promise((r) => window.setTimeout(r, 120 * attempt));
           if (cancelled) return;
+
+          context.save();
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.clearRect(0, 0, renderCanvas.width, renderCanvas.height);
+          context.restore();
           context.clearRect(0, 0, viewport.width, viewport.height);
           renderTask = page.render({ canvasContext: context, viewport });
           await renderTask.promise;
+          if (cancelled) return;
+          if (
+            canvasHasVisiblePixels(context, renderCanvas.width, renderCanvas.height) ||
+            attempt === 2
+          ) {
+            targetCanvas.width = renderCanvas.width;
+            targetCanvas.height = renderCanvas.height;
+            targetCanvas.style.width = `${viewport.width}px`;
+            targetCanvas.style.height = `${viewport.height}px`;
+            const visibleContext = targetCanvas.getContext("2d");
+            if (!visibleContext) throw new Error("Canvas is not available.");
+            visibleContext.setTransform(1, 0, 0, 1, 0, 0);
+            visibleContext.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+            visibleContext.drawImage(renderCanvas, 0, 0);
+            copiedToVisibleCanvas = true;
+            break;
+          }
+        }
+        if (!copiedToVisibleCanvas && !cancelled) {
+          throw new Error("PDF render produced an empty canvas.");
         }
       } catch (error) {
         if (!cancelled) {
+          if (error instanceof Error && /cancel/i.test(error.name)) return;
           setError(error instanceof Error ? error.message : "PDF render failed.");
         }
       }
@@ -1326,6 +1383,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
       correctAnswer:
         draft.type === "word_cloud"
           ? { allowRepeatAnswers: draft.allowRepeatAnswers }
+          : draft.type === "poll"
+            ? null
           : draft.type === "short_answer"
             ? draft.correctText.trim()
               ? { text: draft.correctText.trim() }
@@ -1895,6 +1954,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                         <option value="true_false">是非題</option>
                         <option value="short_answer">簡答題</option>
                         <option value="word_cloud">文字雲</option>
+                        <option value="poll">投票</option>
                         <option value="ranking">排序題</option>
                       </select>
                     </label>
@@ -2029,19 +2089,23 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   />
                 ) : null}
 
-                {draft.type === "multiple_choice" || draft.type === "true_false" ? (
+                {draft.type === "multiple_choice" || draft.type === "true_false" || draft.type === "poll" ? (
                   <div className="form-stack option-editor-card">
-                    <span className="field-label">選項與正確答案</span>
+                    <span className="field-label">
+                      {draft.type === "poll" ? "投票選項" : "選項與正確答案"}
+                    </span>
                     <div className="option-editor">
                       {draft.options.map((option, index) => (
                         <div className="option-edit-row" key={option.id}>
-                          <input
-                            type="radio"
-                            name="correct-answer"
-                            checked={draft.correctOptionId === option.id}
-                            onChange={() => setDraft({ ...draft, correctOptionId: option.id })}
-                            title="設為正確答案"
-                          />
+                          {draft.type === "poll" ? null : (
+                            <input
+                              type="radio"
+                              name="correct-answer"
+                              checked={draft.correctOptionId === option.id}
+                              onChange={() => setDraft({ ...draft, correctOptionId: option.id })}
+                              title="設為正確答案"
+                            />
+                          )}
                           <input
                             value={option.label}
                             disabled={draft.type === "true_false"}
@@ -2055,7 +2119,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                             }}
                             placeholder={`選項 ${index + 1}`}
                           />
-                          {draft.type === "multiple_choice" ? (
+                          {draft.type === "multiple_choice" || draft.type === "poll" ? (
                             <button
                               className="icon-button secondary"
                               type="button"
@@ -2082,7 +2146,7 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                         </div>
                       ))}
                     </div>
-                    {draft.type === "multiple_choice" ? (
+                    {draft.type === "multiple_choice" || draft.type === "poll" ? (
                       <button
                         className="secondary icon-text-button"
                         type="button"
@@ -2673,6 +2737,9 @@ function ChatPanel({
   chatError,
   onChatErrorDismiss,
   onChatOpenChange,
+  initialOpen,
+  openRequest,
+  closeRequest,
   onSend,
   onModerate
 }: {
@@ -2682,11 +2749,14 @@ function ChatPanel({
   chatError?: { id: number; message: string } | null;
   onChatErrorDismiss?: () => void;
   onChatOpenChange?: (isOpen: boolean) => void;
+  initialOpen?: boolean;
+  openRequest?: number;
+  closeRequest?: number;
   onSend?: (content: string) => void;
   onModerate?: (messageId: string, action: string, content?: string) => void;
 }) {
   const [content, setContent] = useState("");
-  const [isOpen, setIsOpenRaw] = useState(role === "admin");
+  const [isOpen, setIsOpenRaw] = useState(initialOpen ?? role === "admin");
   const setIsOpen = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setIsOpenRaw((prev) => {
       const next = typeof v === "function" ? v(prev) : v;
@@ -2737,6 +2807,14 @@ function ChatPanel({
   useEffect(() => {
     if (isOpen) setUnreadCount(0);
   }, [isOpen]);
+
+  useEffect(() => {
+    if (openRequest) setIsOpen(true);
+  }, [openRequest, setIsOpen]);
+
+  useEffect(() => {
+    if (closeRequest) setIsOpen(false);
+  }, [closeRequest, setIsOpen]);
 
   useEffect(() => {
     if (!chatError) return;
@@ -3237,18 +3315,231 @@ function ActivityWaitingPage({
   );
 }
 
+function ActivityPresentationView({
+  activity,
+  remaining,
+  answerRevealed,
+  resultsVisible,
+  responseSummary
+}: {
+  activity: ActivityRecord | null | undefined;
+  remaining: number | null;
+  answerRevealed: boolean;
+  resultsVisible: boolean;
+  responseSummary: ResponseSummary | null;
+}) {
+  if (!activity) {
+    return (
+      <div className="fullscreen-activity">
+        <h2>等待中</h2>
+      </div>
+    );
+  }
+
+  const correctId = correctOptionId(activity.correctAnswer);
+  const nonQuiz = isNonQuizActivity(activity);
+  const showChoices = ["multiple_choice", "true_false", "poll", "ranking"].includes(activity.type);
+
+  return (
+    <div className="fullscreen-activity">
+      <div className="fullscreen-activity-content">
+        <div className="fullscreen-question-copy">
+          <small>{ACTIVITY_TYPE_META[activity.type]?.label ?? "題目"}</small>
+          <h2>{activity.title}</h2>
+          {activity.description ? <p>{activity.description}</p> : null}
+          {answerRevealed && !nonQuiz ? (
+            <div className="countdown ended">已結束作答</div>
+          ) : remaining !== null ? (
+            <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
+              {remaining === 0 ? "時間到" : `剩餘 ${remaining} 秒`}
+            </div>
+          ) : null}
+        </div>
+
+        {showChoices ? (
+          <div className="fullscreen-choices">
+            {activity.options.map((option, index) => {
+              const isCorrect = !nonQuiz && resultsVisible && correctId === option.id;
+              return (
+                <div
+                  className={`fullscreen-choice-item${isCorrect ? " correct" : ""}`}
+                  key={option.id}
+                >
+                  <span>{activity.type === "ranking" ? index + 1 : String.fromCharCode(65 + index)}</span>
+                  <strong>{option.label}</strong>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {resultsVisible ? (
+          <div className="fullscreen-results">
+            {activity.explanation ? (
+              <section className="fullscreen-explanation">
+                <h3>詳解</h3>
+                <p>{activity.explanation}</p>
+              </section>
+            ) : null}
+            <SummaryView summary={responseSummary} />
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ScoreboardOverlay({
+  entries,
+  onClose
+}: {
+  entries?: LeaderboardEntry[];
+  onClose: () => void;
+}) {
+  return (
+    <div className="floating-scoreboard">
+      <div className="floating-card-header">
+        <h2>排行榜</h2>
+        <button className="icon-button secondary" type="button" aria-label="關閉排行榜" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      {entries?.length ? (
+        <ol className="floating-score-list">
+          {entries.map((entry) => (
+            <li key={entry.participantId}>
+              <span className="rank">{entry.rank}</span>
+              <strong>{entry.nickname}</strong>
+              <span>{entry.score}</span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="muted">尚無分數。</p>
+      )}
+    </div>
+  );
+}
+
+function QuickResponseOverlay({
+  quickResponse,
+  role,
+  minimized,
+  onMinimize,
+  onRestore,
+  onPrepare,
+  onOpen,
+  onClose,
+  onSubmit
+}: {
+  quickResponse: LiveState["quickResponse"];
+  role: "admin" | "participant";
+  minimized?: boolean;
+  onMinimize?: () => void;
+  onRestore?: () => void;
+  onPrepare?: () => void;
+  onOpen?: () => void;
+  onClose?: () => void;
+  onSubmit?: () => void;
+}) {
+  if (!quickResponse || quickResponse.status === "closed") return null;
+
+  if (role === "participant" && minimized) {
+    return (
+      <button
+        className="quick-response-mini"
+        type="button"
+        disabled={quickResponse.status !== "open" || Boolean(quickResponse.myEntry)}
+        onClick={quickResponse.status === "open" ? onSubmit : onRestore}
+      >
+        搶答
+      </button>
+    );
+  }
+
+  return (
+    <div className={`quick-response-card ${role}`}>
+      <div className="floating-card-header">
+        <h2>{quickResponse.status === "waiting" ? "開始搶答" : "搶答順序"}</h2>
+        <div className="button-row compact-buttons">
+          {role === "participant" ? (
+            <button className="secondary" type="button" onClick={onMinimize}>
+              最小化
+            </button>
+          ) : null}
+          {role === "admin" ? (
+            <button className="secondary" type="button" onClick={onClose}>
+              關閉
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {role === "admin" ? (
+        <>
+          {quickResponse.status === "waiting" ? (
+            <button type="button" onClick={onOpen}>
+              開始搶答
+            </button>
+          ) : null}
+          <ol className="quick-response-list">
+            {quickResponse.entries.map((entry) => (
+              <li key={entry.id}>
+                <span className="rank">{entry.rank}</span>
+                <strong>{entry.participantName}</strong>
+              </li>
+            ))}
+          </ol>
+          <div className="button-row compact-buttons">
+            <button className="secondary" type="button" onClick={onPrepare}>
+              重新搶答
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <button
+            className="quick-response-main-button"
+            type="button"
+            disabled={quickResponse.status !== "open" || Boolean(quickResponse.myEntry)}
+            onClick={onSubmit}
+          >
+            {quickResponse.myEntry
+              ? `第 ${quickResponse.myEntry.rank} 名`
+              : quickResponse.status === "open"
+                ? "搶答"
+                : "等待開始"}
+          </button>
+          <p className="muted">
+            {quickResponse.status === "open" ? "按下按鈕送出搶答。" : "主持人即將開放搶答。"}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── AdminLivePage ─────────────────────────────────────────────────────────
-function AdminLivePage({ liveId }: { liveId: string }) {
+function AdminLivePage({
+  liveId,
+  presentationWindow = false
+}: {
+  liveId: string;
+  presentationWindow?: boolean;
+}) {
   const token = getAdminToken();
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(presentationWindow);
   const [isMouseActive, setIsMouseActive] = useState(true);
   const [bubbles, setBubbles] = useState<NewMessageBubble[]>([]);
   const [chatIsOpen, setChatIsOpen] = useState(true);
+  const [chatOpenRequest, setChatOpenRequest] = useState(0);
+  const [chatCloseRequest, setChatCloseRequest] = useState(presentationWindow ? 1 : 0);
+  const [scoreboardOpen, setScoreboardOpen] = useState(false);
   // Activity waiting: track if we should show the waiting page before starting a timed activity
   const [waitingForActivity, setWaitingForActivity] = useState<{
     timelineItemId: string;
@@ -3323,7 +3614,8 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const mouseActiveTimerRef = useRef<number | null>(null);
   const knownMessageIdsRef = useRef<Set<string> | null>(null);
   const prevActivityIdRef = useRef<string | null>(null);
-  const prevTimeLimitRef = useRef<number>(0);
+  const previousViewedTimelineItemRef = useRef<TimelineItemRecord | null>(null);
+  const lastMusicStartKeyRef = useRef<string | null>(null);
 
   const joinCode = state?.liveSession.joinCode ?? "";
   const joinUrl = useMemo(() => {
@@ -3402,10 +3694,12 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       // Show bubble if chat is not open or fullscreen
       const known = knownMessageIdsRef.current;
       if (known && !known.has(msg.id)) {
-        setBubbles((prev) => [
-          ...prev.slice(-2),
-          { id: msg.id, author: msg.participantName ?? "匿名", content: msg.content }
-        ]);
+        if (isFullscreen || !chatIsOpen) {
+          setBubbles((prev) => [
+            ...prev.slice(-2),
+            { id: msg.id, author: msg.participantName ?? "匿名", content: msg.content }
+          ]);
+        }
         known.add(msg.id);
       }
     }
@@ -3417,7 +3711,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         setMessages((current) => mergeMessage(current, updated));
       }
     }
-  }, []);
+  }, [chatIsOpen, isFullscreen]);
 
   const showChatError = useCallback((message: string) => {
     chatErrorIdRef.current += 1;
@@ -3445,63 +3739,108 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     return `/api/events/${state.event.id}/presentation/file?token=${encodeURIComponent(token)}&v=${versionParam}`;
   }, [state?.event.id, state?.presentation, token]);
   const isPdfPage = currentTimelineItem?.type === "pdf_page";
-  const isWordCloudActivity = state?.currentActivity?.type === "word_cloud";
+  const currentIsNonQuiz = isNonQuizActivity(state?.currentActivity);
   const hasCurrentActivity = Boolean(state?.currentActivity);
+  const hasVisibleActivity = hasCurrentActivity && !isPdfPage;
   const activityOpen = Boolean(state?.activityOpen);
   const answerClosed = Boolean(state?.answerClosed);
   const isTimedActivity = (state?.currentActivity?.timeLimitSeconds ?? 0) > 0;
+  const resultsVisible = Boolean(state?.liveSession.showResults);
+  const answerRevealed = Boolean(
+    currentIsNonQuiz
+      ? resultsVisible
+      : state?.answerRevealed || (isTimedActivity && remaining === 0) || resultsVisible
+  );
+  const canToggleQuizAnswer = hasVisibleActivity && !currentIsNonQuiz;
+  const canReopenAnswers = hasVisibleActivity && !currentIsNonQuiz && answerClosed && !activityOpen;
 
   // Activity change: detect transition and show waiting page for timed activities
   useEffect(() => {
     const currentActivity = state?.currentActivity;
     const currentActivityId = currentActivity?.id ?? null;
-    const currentTimeLimit = currentActivity?.timeLimitSeconds ?? 0;
-    const prevActivityId = prevActivityIdRef.current;
+    const currentTimelineItemId = currentTimelineItem?.id ?? null;
+    const previousViewedItem = previousViewedTimelineItemRef.current;
 
-    if (currentActivityId && currentActivityId !== prevActivityId) {
-      // New activity loaded
-      const prevItem = prevActivityId;
-      const prevWasPdf = !prevItem; // simplified: if no previous activity, treat as fresh start
-      const prevTimelineIndex = currentIndex - 1;
-      const prevItem2 = timeline[prevTimelineIndex];
-      const prevWasPdfOrNoActivity = !prevItem2 || prevItem2.type === "pdf_page";
-
-      if (currentTimeLimit > 0 && prevWasPdfOrNoActivity && !activityOpen) {
-        // Show waiting page
-        setWaitingForActivity({
-          timelineItemId: currentTimelineItem?.id ?? "",
-          activity: { type: currentActivity!.type, title: currentActivity!.title }
-        });
-      } else {
-        setWaitingForActivity(null);
-      }
+    if (!currentTimelineItemId) {
+      setWaitingForActivity(null);
+      previousViewedTimelineItemRef.current = null;
+      prevActivityIdRef.current = null;
+      return;
     }
-    if (!currentActivityId) {
+
+    const isSameViewedItem =
+      currentTimelineItemId === previousViewedItem?.id && currentActivityId === prevActivityIdRef.current;
+    const needsSameItemWaiting =
+      isSameViewedItem &&
+      currentActivity &&
+      currentActivity.timeLimitSeconds > 0 &&
+      !activityOpen &&
+      !answerClosed &&
+      waitingForActivity?.timelineItemId !== currentTimelineItemId;
+
+    if (isSameViewedItem && !needsSameItemWaiting) {
+      return;
+    }
+
+    if (currentActivity && currentActivity.timeLimitSeconds > 0 && !activityOpen && !answerClosed) {
+      const previousActivity =
+        !isSameViewedItem && previousViewedItem?.type === "activity" && previousViewedItem.activityId
+          ? timeline.find((item) => item.id === previousViewedItem.id)?.activity ??
+            state?.activities?.find((activity) => activity.id === previousViewedItem.activityId) ??
+            null
+          : null;
+      const previousWasTimedActivity = Boolean(previousActivity && previousActivity.timeLimitSeconds > 0);
+
+      if (previousWasTimedActivity) {
+        setWaitingForActivity(null);
+        socket.send("start_activity", {});
+      } else {
+        setWaitingForActivity({
+          timelineItemId: currentTimelineItemId,
+          activity: { type: currentActivity.type, title: currentActivity.title }
+        });
+      }
+    } else {
       setWaitingForActivity(null);
     }
+
+    previousViewedTimelineItemRef.current = currentTimelineItem;
     prevActivityIdRef.current = currentActivityId;
-    prevTimeLimitRef.current = currentTimeLimit;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state?.currentActivity?.id]);
+  }, [activityOpen, answerClosed, currentTimelineItem?.id, state?.currentActivity?.id]);
 
   // Music: play game music when timed activity starts
   useEffect(() => {
-    if (activityOpen && isTimedActivity) {
-      loadMusicJson().then((music) => {
-        const gameSongs = music["game"] ?? [];
-        if (gameSongs.length) {
-          const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
-          musicPlayer.play(publicAssetUrl(song));
-        }
-      });
-    } else {
-      // Stop music when time's up or activity not open
-      if (!activityOpen || remaining === 0) {
-        musicPlayer.stop();
-      }
+    const startedAt = state?.liveSession.currentActivityStartedAt ?? null;
+    const activityId = state?.currentActivity?.id ?? null;
+    const startKey = activityId && startedAt ? `${activityId}:${startedAt}` : null;
+
+    if (!activityOpen || !isTimedActivity || answerClosed || remaining === 0 || !startKey) {
+      lastMusicStartKeyRef.current = null;
+      musicPlayer.stop();
+      return;
     }
+
+    if (lastMusicStartKeyRef.current === startKey) return;
+    lastMusicStartKeyRef.current = startKey;
+
+    loadMusicJson().then((music) => {
+      if (lastMusicStartKeyRef.current !== startKey) return;
+      const gameSongs = music["game"] ?? [];
+      if (gameSongs.length) {
+        const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
+        musicPlayer.play(publicAssetUrl(song));
+      }
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activityOpen, isTimedActivity]);
+  }, [
+    activityOpen,
+    answerClosed,
+    isTimedActivity,
+    remaining,
+    state?.currentActivity?.id,
+    state?.liveSession.currentActivityStartedAt
+  ]);
 
   useEffect(() => {
     if (remaining === 0) musicPlayer.stop();
@@ -3549,41 +3888,41 @@ function AdminLivePage({ liveId }: { liveId: string }) {
 
   // Fullscreen API
   const enterFullscreen = useCallback(() => {
-    const el = fullscreenContainerRef.current;
+    const el = document.documentElement;
     if (el?.requestFullscreen) {
       el.requestFullscreen().catch(() => {});
     }
     setIsFullscreen(true);
     setIsMouseActive(true);
+    setChatCloseRequest((current) => current + 1);
   }, []);
 
   const exitFullscreen = useCallback(() => {
+    if (presentationWindow) {
+      window.close();
+      return;
+    }
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     setIsFullscreen(false);
-  }, []);
+  }, [presentationWindow]);
 
   useEffect(() => {
     const handler = () => {
+      if (presentationWindow) return;
       if (!document.fullscreenElement) setIsFullscreen(false);
     };
     document.addEventListener("fullscreenchange", handler);
     return () => document.removeEventListener("fullscreenchange", handler);
-  }, []);
+  }, [presentationWindow]);
 
   // Open new window for fullscreen on another screen
   const openFullscreenWindow = useCallback(() => {
-    const w = window.open(
+    window.open(
       `/admin/live/${liveId}/fullscreen`,
       "slihoot-presentation",
       "width=1280,height=720,toolbar=no,menubar=no,scrollbars=no"
     );
-    if (!w) return;
-    // Pass current state via postMessage after window loads
-    const onLoad = () => {
-      w.postMessage({ type: "init_fullscreen", liveId, token }, "*");
-    };
-    w.addEventListener("load", onLoad, { once: true });
-  }, [liveId, token]);
+  }, [liveId]);
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
@@ -3615,14 +3954,6 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   function handleStartActivity() {
     setWaitingForActivity(null);
     socket.send("start_activity", {});
-    // Start music
-    loadMusicJson().then((music) => {
-      const gameSongs = music["game"] ?? [];
-      if (gameSongs.length) {
-        const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
-        musicPlayer.play(publicAssetUrl(song));
-      }
-    });
   }
 
   const stagePart = (
@@ -3648,11 +3979,15 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         <>
           <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
           <p>{state?.currentActivity?.description}</p>
-          {answerClosed ? (
+          {answerClosed && !currentIsNonQuiz ? (
             <div className="countdown ended">已結束作答（已公布答案）</div>
           ) : remaining !== null ? (
             <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
-              {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
+              {remaining === 0
+                ? currentIsNonQuiz
+                  ? "時間到"
+                  : "時間到（已公布答案）"
+                : `剩餘 ${remaining} 秒`}
             </div>
           ) : hasCurrentActivity && !activityOpen ? (
             <div className="countdown">尚未開始作答，參與者看不到題目</div>
@@ -3664,13 +3999,17 @@ function AdminLivePage({ liveId }: { liveId: string }) {
 
   const controlPart = (
     <div className="button-row">
-      {hasCurrentActivity && !activityOpen && !waitingForActivity ? (
+      {hasVisibleActivity && !currentIsNonQuiz && !waitingForActivity ? (
         <button
-          disabled={!socket.connected}
+          disabled={!socket.connected || activityOpen || (!canReopenAnswers && answerClosed)}
           title={!socket.connected ? "連線中，請稍候" : undefined}
-          onClick={() => socket.send("start_activity", {})}
+          onClick={() =>
+            canReopenAnswers
+              ? socket.send("continue_accepting_answers", {})
+              : socket.send("start_activity", {})
+          }
         >
-          開始答題
+          {canReopenAnswers ? "繼續接受回答" : "開始答題"}
         </button>
       ) : null}
       <button
@@ -3692,23 +4031,39 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         下一頁
       </button>
       <button
-        hidden={!hasCurrentActivity || isWordCloudActivity || isTimedActivity}
+        hidden={!canToggleQuizAnswer}
         className="outline-accent"
-        disabled={!socket.connected || Boolean(state?.liveSession.showResults)}
+        disabled={!socket.connected}
         title={
           !socket.connected
             ? "連線中，請稍候"
             : state?.liveSession.showResults
-              ? "答案已公布，本題作答已結束"
+              ? "隱藏答案但保持本題作答關閉"
               : "公布答案並結束本題作答"
         }
-        onClick={() => socket.send("set_results_visibility", { showResults: true })}
+        onClick={() =>
+          socket.send("set_results_visibility", {
+            showResults: !state?.liveSession.showResults
+          })
+        }
       >
-        公布答案
+        {state?.liveSession.showResults ? "隱藏答案" : "公布答案"}
+      </button>
+      <button
+        hidden={!hasVisibleActivity || !currentIsNonQuiz}
+        className="secondary"
+        disabled={!socket.connected}
+        onClick={() =>
+          socket.send("set_results_visibility", {
+            showResults: !state?.liveSession.showResults
+          })
+        }
+      >
+        {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
       </button>
       <label
         className="toggle-row live-name-toggle"
-        hidden={!hasCurrentActivity || isWordCloudActivity}
+        hidden={!hasVisibleActivity || state?.currentActivity?.type === "word_cloud"}
         title="切換記名明細"
       >
         <span>
@@ -3726,7 +4081,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           }
         />
       </label>
-      {hasCurrentActivity ? (
+      {hasVisibleActivity ? (
         <button
           className="secondary"
           title="重置這題的計時和作答"
@@ -3735,25 +4090,40 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           重置
         </button>
       ) : null}
-      <button className="outline-danger" onClick={endLive}>
-        結束
+      <button className="secondary" type="button" onClick={() => setScoreboardOpen(true)}>
+        顯示排行榜
+      </button>
+      <button
+        className="secondary"
+        type="button"
+        disabled={!socket.connected}
+        onClick={() => socket.send("prepare_quick_response", {})}
+      >
+        搶答
       </button>
     </div>
   );
 
   return (
     <AdminGuard>
-      <Header
-        title="主持畫面"
-        actions={
-          <>
-            <button className="secondary icon-button" title="進入全螢幕" onClick={enterFullscreen}>⛶</button>
-            <button className="secondary icon-button" title="在新視窗開啟展示" onClick={openFullscreenWindow}>⊹</button>
-            <button onClick={() => navigate("/admin/dashboard")}>回列表</button>
-          </>
-        }
-      />
-      <main className="page live-layout">
+      {presentationWindow ? null : (
+        <Header
+          title="主持畫面"
+          actions={
+            <>
+              <button className="secondary icon-button" title="進入全螢幕" onClick={enterFullscreen}>⛶</button>
+              <button className="secondary icon-button" title="在新視窗開啟展示" onClick={openFullscreenWindow}>⊹</button>
+              <button className="outline-danger" onClick={endLive}>結束</button>
+              <button onClick={() => navigate("/admin/dashboard")}>回列表</button>
+            </>
+          }
+        />
+      )}
+      <main
+        className={`page live-layout${presentationWindow ? " presentation-window" : ""}${
+          isFullscreen ? " is-presentation-active" : ""
+        }`}
+      >
         <ErrorBanner message={error} />
         <dialog
           ref={qrDialogRef}
@@ -3816,22 +4186,13 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                     onStart={handleStartActivity}
                   />
                 ) : (
-                  <div className="fullscreen-activity">
-                    <h2>{state?.currentActivity?.title ?? "等待中"}</h2>
-                    {state?.currentActivity?.description ? <p>{state.currentActivity.description}</p> : null}
-                    {answerClosed ? (
-                      <div className="countdown ended">已結束作答</div>
-                    ) : remaining !== null ? (
-                      <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
-                        {remaining === 0 ? "時間到" : `剩餘 ${remaining} 秒`}
-                      </div>
-                    ) : null}
-                    {hasCurrentActivity && (state?.liveSession.showResults || answerClosed) ? (
-                      <div className="fullscreen-results">
-                        <SummaryView summary={state?.responseSummary ?? null} />
-                      </div>
-                    ) : null}
-                  </div>
+                  <ActivityPresentationView
+                    activity={state?.currentActivity}
+                    remaining={remaining}
+                    answerRevealed={answerRevealed}
+                    resultsVisible={resultsVisible}
+                    responseSummary={state?.responseSummary ?? null}
+                  />
                 )}
               </div>
               <div className="fullscreen-controls">
@@ -3842,8 +4203,17 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                   <span>{currentIndex + 1} / {timeline.length}</span>
                 </div>
                 <div className="fullscreen-buttons">
-                  {hasCurrentActivity && !activityOpen && !waitingForActivity ? (
-                    <button onClick={() => socket.send("start_activity", {})}>開始答題</button>
+                  {hasVisibleActivity && !currentIsNonQuiz && !waitingForActivity ? (
+                    <button
+                      disabled={!socket.connected || activityOpen || (!canReopenAnswers && answerClosed)}
+                      onClick={() =>
+                        canReopenAnswers
+                          ? socket.send("continue_accepting_answers", {})
+                          : socket.send("start_activity", {})
+                      }
+                    >
+                      {canReopenAnswers ? "繼續接受回答" : "開始答題"}
+                    </button>
                   ) : null}
                   <button
                     disabled={!previousTimelineItem || !socket.connected}
@@ -3853,7 +4223,48 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                     disabled={!nextTimelineItem || !socket.connected}
                     onClick={() => nextTimelineItem && socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id })}
                   >下一頁</button>
-                  <button className="secondary" onClick={exitFullscreen}>離開全螢幕</button>
+                  {currentIsNonQuiz && hasVisibleActivity ? (
+                    <button
+                      className="secondary"
+                      disabled={!socket.connected}
+                      onClick={() =>
+                        socket.send("set_results_visibility", {
+                          showResults: !state?.liveSession.showResults
+                        })
+                      }
+                    >
+                      {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
+                    </button>
+                  ) : canToggleQuizAnswer ? (
+                    <button
+                      className="secondary"
+                      disabled={!socket.connected}
+                      onClick={() =>
+                        socket.send("set_results_visibility", {
+                          showResults: !state?.liveSession.showResults
+                        })
+                      }
+                    >
+                      {state?.liveSession.showResults ? "隱藏答案" : "公布答案"}
+                    </button>
+                  ) : null}
+                  <button className="secondary" onClick={() => setScoreboardOpen(true)}>排行榜</button>
+                  <button
+                    className="secondary"
+                    disabled={!socket.connected}
+                    onClick={() => socket.send("prepare_quick_response", {})}
+                  >
+                    搶答
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => setChatOpenRequest((current) => current + 1)}
+                  >
+                    Q&A
+                  </button>
+                  <button className="secondary" onClick={exitFullscreen}>
+                    {presentationWindow ? "關閉視窗" : "離開全螢幕"}
+                  </button>
                 </div>
               </div>
               {/* Bubbles in fullscreen */}
@@ -3866,6 +4277,19 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                   />
                 ))}
               </div>
+              <QuickResponseOverlay
+                quickResponse={state?.quickResponse ?? null}
+                role="admin"
+                onPrepare={() => socket.send("prepare_quick_response", {})}
+                onOpen={() => socket.send("open_quick_response", {})}
+                onClose={() => socket.send("close_quick_response", {})}
+              />
+              {scoreboardOpen ? (
+                <ScoreboardOverlay
+                  entries={state?.leaderboard}
+                  onClose={() => setScoreboardOpen(false)}
+                />
+              ) : null}
             </>
           ) : null}
         </div>
@@ -3895,6 +4319,24 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           <Leaderboard entries={state?.leaderboard} />
         </section>
 
+        {!isFullscreen ? (
+          <>
+            <QuickResponseOverlay
+              quickResponse={state?.quickResponse ?? null}
+              role="admin"
+              onPrepare={() => socket.send("prepare_quick_response", {})}
+              onOpen={() => socket.send("open_quick_response", {})}
+              onClose={() => socket.send("close_quick_response", {})}
+            />
+            {scoreboardOpen ? (
+              <ScoreboardOverlay
+                entries={state?.leaderboard}
+                onClose={() => setScoreboardOpen(false)}
+              />
+            ) : null}
+          </>
+        ) : null}
+
         {/* Bubble toasts (non-fullscreen) */}
         <div className="bubble-toast-stack">
           {!isFullscreen && bubbles.map((b) => (
@@ -3910,6 +4352,9 @@ function AdminLivePage({ liveId }: { liveId: string }) {
           role="admin"
           messages={messages}
           chatError={chatError}
+          initialOpen={!presentationWindow}
+          openRequest={chatOpenRequest}
+          closeRequest={chatCloseRequest}
           onChatErrorDismiss={dismissChatError}
           onChatOpenChange={setChatIsOpen}
           onSend={(content) => socket.send("send_message", { content })}
@@ -4090,6 +4535,7 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
   const chatErrorIdRef = useRef(0);
   const [localResponse, setLocalResponse] = useState<ResponseRecord | null>(null);
+  const [quickResponseMinimized, setQuickResponseMinimized] = useState(false);
 
   useEffect(() => {
     if (!participantToken) {
@@ -4161,7 +4607,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
 
   const currentActivity = state?.currentActivity ?? null;
   const wordCloudRepeatAllowed =
-    currentActivity?.type === "word_cloud" ? Boolean(currentActivity.allowRepeatAnswers) : false;
+    currentActivity?.type === "word_cloud" ? true : false;
+  const currentIsNonQuiz = isNonQuizActivity(currentActivity);
   const answerLocked =
     Boolean(localResponse) &&
     (currentActivity?.type !== "word_cloud" || !wordCloudRepeatAllowed);
@@ -4177,11 +4624,13 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const remaining = useServerCountdown(state);
   const revealed = Boolean(state?.answerRevealed);
   const closed = Boolean(state?.answerClosed);
-  const timeUp = remaining === 0 || revealed;
+  const timeUp = !currentIsNonQuiz && (remaining === 0 || revealed);
   const sortedMessages = useMemo(
     () => [...messages].sort((a, b) => Number(a.pinned !== b.pinned) * (a.pinned ? -1 : 1)),
     [messages]
   );
+  const quickResponseOpen = state?.quickResponse?.status === "open";
+  const canQuickRespond = quickResponseOpen && !state?.quickResponse?.myEntry;
 
   if (!participantToken) {
     return (
@@ -4221,7 +4670,23 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
 
   return (
     <>
-    <Header title={state?.event.title ?? "活動中"} actions={<button onClick={() => navigate("/")}>首頁</button>} />
+    <Header
+      title={state?.event.title ?? "活動中"}
+      actions={
+        <>
+          {state?.quickResponse && state.quickResponse.status !== "closed" ? (
+            <button
+              className="secondary"
+              disabled={!canQuickRespond}
+              onClick={() => socket.send("submit_quick_response", {})}
+            >
+              搶答
+            </button>
+          ) : null}
+          <button onClick={() => navigate("/")}>首頁</button>
+        </>
+      }
+    />
     <main className="page live-layout participant">
       {error ? (
         <div className="error-stack">
@@ -4253,7 +4718,7 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
               disabled={
                 closed ||
                 state?.liveSession.status !== "active" ||
-                (currentActivity.type === "word_cloud" ? answerLocked || timeUp : answerLocked || timeUp)
+                (currentActivity.type === "word_cloud" ? false : answerLocked || timeUp)
               }
               revealed={revealed}
               submittedOptionId={submittedOptionId}
@@ -4306,6 +4771,14 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
           socket.send("moderate_message", { messageId, action, content })
         }
       />
+      <QuickResponseOverlay
+        quickResponse={state?.quickResponse ?? null}
+        role="participant"
+        minimized={quickResponseMinimized}
+        onMinimize={() => setQuickResponseMinimized(true)}
+        onRestore={() => setQuickResponseMinimized(false)}
+        onSubmit={() => socket.send("submit_quick_response", {})}
+      />
     </main>
     </>
   );
@@ -4319,6 +4792,11 @@ export function App() {
 
   const eventMatch = path.match(/^\/admin\/event\/([^/]+)$/);
   if (eventMatch) return <EventEditorPage eventId={eventMatch[1]} />;
+
+  const adminFullscreenMatch = path.match(/^\/admin\/live\/([^/]+)\/fullscreen$/);
+  if (adminFullscreenMatch) {
+    return <AdminLivePage liveId={adminFullscreenMatch[1]} presentationWindow />;
+  }
 
   const adminLiveMatch = path.match(/^\/admin\/live\/([^/]+)$/);
   if (adminLiveMatch) return <AdminLivePage liveId={adminLiveMatch[1]} />;

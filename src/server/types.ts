@@ -3,7 +3,9 @@ export type ActivityType =
   | "true_false"
   | "short_answer"
   | "word_cloud"
+  | "poll"
   | "ranking";
+export type QuickResponseStatus = "waiting" | "open" | "closed";
 export type LiveStatus = "waiting" | "active" | "ended";
 export type MessageStatus = "visible" | "hidden" | "deleted";
 export type TimelineItemType = "pdf_page" | "activity";
@@ -92,6 +94,7 @@ export interface LiveSessionRecord {
   currentActivityIndex: number;
   currentActivityStartedAt: string | null;
   completedActivityIds: string[];
+  noScoreActivityIds: string[];
   showResults: boolean;
   showParticipantNames: boolean;
   startedAt: string | null;
@@ -163,6 +166,27 @@ export interface LeaderboardEntry {
   rank: number;
 }
 
+export interface QuickResponseEntryRecord {
+  id: string;
+  runId: string;
+  liveSessionId: string;
+  participantId: string;
+  participantName: string;
+  rank: number;
+  clickedAt: string;
+}
+
+export interface QuickResponseState {
+  id: string;
+  liveSessionId: string;
+  status: QuickResponseStatus;
+  startedAt: string | null;
+  closedAt: string | null;
+  createdAt: string;
+  entries: QuickResponseEntryRecord[];
+  myEntry?: QuickResponseEntryRecord | null;
+}
+
 export interface LiveState {
   liveSession: LiveSessionRecord;
   event: EventRecord;
@@ -177,6 +201,7 @@ export interface LiveState {
   answerRevealed: boolean;
   answerClosed: boolean;
   activityOpen: boolean;
+  quickResponse: QuickResponseState | null;
   leaderboard?: LeaderboardEntry[];
   myScore?: number;
   myRank?: number | null;
