@@ -111,6 +111,18 @@ async function run() {
   assert(activity.id, "activity not created");
   ok(`activity created (${activity.id})`);
 
+  // 4b. Untimed activity (timeLimitSeconds: 0) must be accepted — 0 means
+  // "no time limit" and switches the question to answer-order scoring.
+  const untimed = await api(
+    "POST",
+    `/api/events/${event.id}/activities`,
+    { type: "true_false", title: "smoke untimed Q", timeLimitSeconds: 0, correctAnswer: { optionId: "true" } },
+    token
+  );
+  assert(untimed.id, "untimed activity not created");
+  assert(untimed.timeLimitSeconds === 0, `untimed activity should keep 0 limit (got ${untimed.timeLimitSeconds})`);
+  ok(`untimed activity created (${untimed.id}, 不限時)`);
+
   // 5. Start live session
   const live = await api("POST", `/api/events/${event.id}/live-sessions`, {}, token);
   assert(live.id && live.joinCode, "live session not started");

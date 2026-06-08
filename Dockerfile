@@ -27,6 +27,11 @@ COPY src ./src
 COPY migrations ./migrations
 COPY --from=build /app/dist ./dist
 
+# Pre-create the uploads dir and hand it to the non-root `bun` user, otherwise
+# runtime writes to /app/uploads (presentation PDFs) fail with EACCES because
+# /app is owned by root. This dir is the mount point for the uploads volume.
+RUN mkdir -p /app/uploads && chown -R bun:bun /app/uploads
+
 # Drop root privileges (the oven/bun image ships a non-root `bun` user).
 USER bun
 

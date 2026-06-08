@@ -35,16 +35,34 @@ const EVENT_TTL = 10;
 const SUMMARY_TTL = 3;
 const LEADERBOARD_TTL = 3;
 
-// Classic Kahoot-style scoring: a wrong answer scores 0; a correct answer
-// scores up to MAX_SCORE, scaled down by how long the participant took relative
-// to the question's time limit. Answering instantly ~= MAX_SCORE; using the
-// full time still earns half. Questions with no time limit award the full
-// MAX_SCORE for any correct answer.
+// Scoring. A wrong answer always scores 0. A correct answer is scored one of
+// two ways, depending on whether the question is timed:
+//
+//  - Timed question (limitSeconds > 0): classic Kahoot speed scoring. Up to
+//    MAX_SCORE, scaled down by how long the participant took relative to the
+//    limit. Answering instantly ~= MAX_SCORE; using the full time still earns
+//    half.
+//
+//  - Untimed question (limitSeconds <= 0): there is no clock to reward speed,
+//    so we reward *answer order* instead. The first participant to answer
+//    correctly earns MAX_SCORE, and each subsequent correct answer is worth
+//    SCORE_STEP less, with a MIN_CORRECT_SCORE floor so late-but-correct still
+//    beats wrong. `correctRank` is the 1-based position among correct answers.
 const MAX_SCORE = 1000;
+const SCORE_STEP = 100;
+const MIN_CORRECT_SCORE = 100;
 
-function computeScore(isCorrect: boolean, elapsedMs: number, limitSeconds: number) {
+function computeScore(
+  isCorrect: boolean,
+  elapsedMs: number,
+  limitSeconds: number,
+  correctRank: number
+) {
   if (!isCorrect) return 0;
-  if (limitSeconds <= 0) return MAX_SCORE;
+  if (limitSeconds <= 0) {
+    const rank = Math.max(1, Math.floor(correctRank));
+    return Math.max(MIN_CORRECT_SCORE, MAX_SCORE - (rank - 1) * SCORE_STEP);
+  }
   const fraction = Math.min(1, Math.max(0, elapsedMs / (limitSeconds * 1000)));
   return Math.round(MAX_SCORE * (1 - fraction / 2));
 }
@@ -867,10 +885,9 @@ export async function createActivity(
   const title = normalizeText(input.title, 60000) || "未命名題目";
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
+  // 0 (or unset) means "no time limit" — a valid choice that switches the
+  // question to answer-order scoring. clampTimeLimit normalises it to 0.
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
-  if (timeLimitSeconds <= 0) {
-    throw new Error("請設定作答秒數（需大於 0）。");
-  }
   const options = normalizeOptions(type, input.options);
 
   if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
@@ -978,10 +995,9 @@ export async function updateActivity(
   const title = normalizeText(input.title, 60000) || "未命名題目";
   const description = normalizeText(input.description, 2000);
   const explanation = normalizeText(input.explanation, 2000);
+  // 0 (or unset) means "no time limit" — a valid choice that switches the
+  // question to answer-order scoring. clampTimeLimit normalises it to 0.
   const timeLimitSeconds = clampTimeLimit(input.timeLimitSeconds);
-  if (timeLimitSeconds <= 0) {
-    throw new Error("請設定作答秒數（需大於 0）。");
-  }
   const options = normalizeOptions(type, input.options);
 
   if ((type === "multiple_choice" || type === "ranking") && options.length < 2) {
@@ -1292,9 +1308,27 @@ export async function startActivity(liveId: string) {
 }
 
 export async function setResultsVisibility(liveId: string, showResults: boolean) {
+  const liveSession = await getLiveSession(liveId);
+  if (!liveSession) return null;
+
+  // Revealing results closes answering for the current question, and that lock
+  // is terminal: toggling results back off hides the display but does not
+  // re-open submissions. (Timed questions close on time-up instead.)
+  const completed = new Set(liveSession.completedActivityIds);
+  if (showResults && liveSession.currentActivityId) {
+    completed.add(liveSession.currentActivityId);
+  }
+
   await pool.execute(
-    `UPDATE live_sessions SET show_results = :showResults WHERE id = :liveId`,
-    { liveId, showResults }
+    `UPDATE live_sessions
+     SET show_results = :showResults,
+         completed_activity_ids = :completedActivityIds
+     WHERE id = :liveId`,
+    {
+      liveId,
+      showResults,
+      completedActivityIds: stringifyJson(Array.from(completed))
+    }
   );
   return getLiveSession(liveId);
 }
@@ -1510,6 +1544,21 @@ export async function submitAnswer(input: {
   const activity = await getActivity(input.activityId);
   if (!activity) throw new Error("Activity not found.");
 
+  // Answering is closed once the question is locked. For timed questions the
+  // clock running out closes it automatically; for untimed questions the host
+  // closes it by revealing results. A question that has been advanced past
+  // (completed) is closed too. Enforce this server-side so a late/crafted WS
+  // message can't slip an answer in after the reveal.
+  const startedMs = new Date(liveSession.currentActivityStartedAt).getTime();
+  const answeringClosed =
+    liveSession.completedActivityIds.includes(input.activityId) ||
+    (activity.timeLimitSeconds > 0
+      ? Date.now() - startedMs >= activity.timeLimitSeconds * 1000
+      : liveSession.showResults);
+  if (answeringClosed) {
+    throw new Error("這一題已結束作答。");
+  }
+
   const existingResponse = await getResponse(input.liveId, input.activityId, input.participantId);
   if (activity.type === "word_cloud" && existingResponse && !activity.allowRepeatAnswers) {
     throw new Error("這一題不開放重複填答。");
@@ -1530,9 +1579,29 @@ export async function submitAnswer(input: {
         }
       : answer;
 
-  // Kahoot-style score, locked in at answer time from correctness + speed.
+  // Score is locked in at answer time. Timed questions reward speed; untimed
+  // questions reward answer order, so for a correct untimed answer we need the
+  // participant's rank among everyone who has already answered correctly.
+  const isCorrect = isAnswerCorrect(activity, answer);
   const elapsedMs = receivedAt.getTime() - new Date(liveSession.currentActivityStartedAt).getTime();
-  const score = computeScore(isAnswerCorrect(activity, answer), elapsedMs, activity.timeLimitSeconds);
+  let correctRank = 1;
+  if (isCorrect && activity.timeLimitSeconds <= 0) {
+    const [rankRows] = await pool.execute(
+      `SELECT COUNT(*) AS earlierCorrect
+         FROM responses
+        WHERE live_session_id = :liveId
+          AND activity_id = :activityId
+          AND participant_id <> :participantId
+          AND score > 0`,
+      {
+        liveId: input.liveId,
+        activityId: input.activityId,
+        participantId: input.participantId
+      }
+    );
+    correctRank = Number((rankRows as any[])[0]?.earlierCorrect ?? 0) + 1;
+  }
+  const score = computeScore(isCorrect, elapsedMs, activity.timeLimitSeconds, correctRank);
 
   await pool.execute(
     `INSERT INTO responses
@@ -1928,7 +1997,8 @@ export async function getLiveState(
 
 export async function createMessage(input: {
   liveId: string;
-  participantId: string;
+  participantId: string | null;
+  senderName?: string;
   content: unknown;
 }) {
   const liveSession = await getLiveSession(input.liveId);
@@ -1940,13 +2010,15 @@ export async function createMessage(input: {
   if (!content) throw new Error("Message content is required.");
 
   const messageId = id();
+  const senderName = normalizeText(input.senderName, 80) || null;
   await pool.execute(
-    `INSERT INTO live_messages (id, live_session_id, participant_id, content)
-     VALUES (:id, :liveId, :participantId, :content)`,
+    `INSERT INTO live_messages (id, live_session_id, participant_id, sender_name, content)
+     VALUES (:id, :liveId, :participantId, :senderName, :content)`,
     {
       id: messageId,
       liveId: input.liveId,
       participantId: input.participantId,
+      senderName,
       content
     }
   );
@@ -1960,7 +2032,7 @@ export async function getMessage(messageId: string) {
       m.id,
       m.live_session_id AS liveSessionId,
       m.participant_id AS participantId,
-      p.nickname AS participantName,
+      COALESCE(m.sender_name, p.nickname, '主持人') AS participantName,
       m.content,
       m.status,
       m.pinned,
@@ -1968,7 +2040,7 @@ export async function getMessage(messageId: string) {
       m.updated_at AS updatedAt,
       m.moderated_at AS moderatedAt
     FROM live_messages m
-    INNER JOIN participants p ON p.id = m.participant_id
+    LEFT JOIN participants p ON p.id = m.participant_id
     WHERE m.id = :messageId`,
     { messageId }
   );
@@ -1983,7 +2055,7 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
       m.id,
       m.live_session_id AS liveSessionId,
       m.participant_id AS participantId,
-      p.nickname AS participantName,
+      COALESCE(m.sender_name, p.nickname, '主持人') AS participantName,
       m.content,
       m.status,
       m.pinned,
@@ -1991,7 +2063,7 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
       m.updated_at AS updatedAt,
       m.moderated_at AS moderatedAt
     FROM live_messages m
-    INNER JOIN participants p ON p.id = m.participant_id
+    LEFT JOIN participants p ON p.id = m.participant_id
     WHERE m.live_session_id = :liveId
       AND m.status <> 'deleted'
       AND (:includeHidden = TRUE OR m.status = 'visible')
@@ -2005,7 +2077,8 @@ export async function listMessages(liveId: string, includeHidden = false, limit 
 export async function moderateMessage(input: {
   liveId: string;
   messageId: string;
-  action: "hide" | "show" | "delete" | "pin" | "unpin";
+  action: "hide" | "show" | "delete" | "pin" | "unpin" | "edit";
+  content?: unknown;
 }) {
   const actionToStatus: Partial<Record<typeof input.action, MessageStatus>> = {
     hide: "hidden",
@@ -2015,7 +2088,20 @@ export async function moderateMessage(input: {
 
   const status = actionToStatus[input.action];
 
-  if (status) {
+  if (input.action === "edit") {
+    const content = normalizeText(input.content, 200);
+    if (!content) throw new Error("Message content is required.");
+    await pool.execute(
+      `UPDATE live_messages
+       SET content = :content
+       WHERE id = :messageId AND live_session_id = :liveId AND status <> 'deleted'`,
+      {
+        liveId: input.liveId,
+        messageId: input.messageId,
+        content
+      }
+    );
+  } else if (status) {
     await pool.execute(
       `UPDATE live_messages
        SET status = :status,

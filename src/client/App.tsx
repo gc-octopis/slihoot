@@ -1,4 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type {
   ActiveLiveSessionSummary,
@@ -28,6 +37,9 @@ import {
   setAdminToken
 } from "./api";
 
+import logo from '/logo.svg?url';
+import logoSmall from '/logo_small.svg?url';
+
 type EventListItem = EventRecord & {
   activityCount: number;
   activeLiveSession: ActiveLiveSessionSummary | null;
@@ -36,6 +48,12 @@ type EventDetail = EventRecord & {
   activities: ActivityRecord[];
   presentation: EventPresentationRecord | null;
   timeline: TimelineItemRecord[];
+  alarms?: AlarmRecord[];
+};
+type AlarmRecord = {
+  id: string;
+  time: string; // HH:MM
+  songFile: string;
 };
 type ActivityDraft = {
   type: ActivityType;
@@ -50,16 +68,6 @@ type ActivityDraft = {
   options: ActivityOption[];
   correctOptionId: string;
   correctText: string;
-};
-
-type TryCloudflareTunnelState = {
-  status: "stopped" | "starting" | "running" | "error";
-  localUrl: string | null;
-  publicUrl: string | null;
-  pid: number | null;
-  startedAt: string | null;
-  lastError: string | null;
-  logs: string[];
 };
 
 type PdfViewport = {
@@ -311,6 +319,7 @@ function useServerCountdown(state: LiveState | null) {
   }, [state?.serverNow]);
 
   useEffect(() => {
+    // No activity, no time limit, or activity hasn't started: clear countdown
     if (!activityId || !startedAt || limit <= 0) {
       setRemaining(null);
       return;
@@ -322,7 +331,11 @@ function useServerCountdown(state: LiveState | null) {
     };
     tick();
     const interval = window.setInterval(tick, 250);
-    return () => window.clearInterval(interval);
+    return () => {
+      window.clearInterval(interval);
+      // Reset remaining when the effect cleanup runs (activity changes)
+      setRemaining(null);
+    };
   }, [activityId, startedAt, limit]);
 
   return remaining;
@@ -340,20 +353,101 @@ function AdminGuard({ children }: { children: React.ReactNode }) {
 }
 
 function Header({ title, actions }: { title: string; actions?: React.ReactNode }) {
+  const actionsRef = useRef<HTMLDivElement | null>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const el = actionsRef.current;
+    if (!el) return;
+    const check = () => {
+      // If actions container scroll width exceeds client width, collapse to dropdown
+      setOverflowing(el.scrollWidth > el.offsetWidth + 2);
+    };
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [actions]);
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [dropdownOpen]);
+
   return (
+    <>
     <header className="app-header">
-      <button className="brand" onClick={() => navigate("/")}>
-        Slihoot
-      </button>
-      <h1>{title}</h1>
-      <div className="header-actions">{actions}</div>
+      <div className="brand" onClick={() => navigate("/")}>
+        <img className="logo-full" src={logo} alt="Slihoot" />
+        <img className="logo-mark" src={logoSmall} alt="Slihoot" />
+      </div>
+      <h1 className="header-title">{title}</h1>
+      <div className="header-actions" ref={actionsRef} style={overflowing ? { opacity: 0, pointerEvents: "none", position: "absolute" } : undefined}>
+        {actions}
+      </div>
+      {overflowing && actions ? (
+        <div className="header-dropdown-wrap" ref={dropdownRef}>
+          <button
+            className="header-menu-button secondary icon-button"
+            aria-label="選單"
+            onClick={() => setDropdownOpen((v) => !v)}
+          >
+            ≡
+          </button>
+          {dropdownOpen && (
+            <div className="header-dropdown" onClick={() => setDropdownOpen(false)}>
+              {actions}
+            </div>
+          )}
+        </div>
+      ) : null}
     </header>
+    <div className="header-spacing"></div>
+    </>
   );
 }
 
 function ErrorBanner({ message }: { message: string | null }) {
   if (!message) return null;
   return <div className="error-banner">{message}</div>;
+}
+
+function AutoDismissErrorBanner({
+  message,
+  onDismiss,
+  timeoutMs = 5000,
+  fadeMs = 400
+}: {
+  message: string | null;
+  onDismiss: () => void;
+  timeoutMs?: number;
+  fadeMs?: number;
+}) {
+  const [isLeaving, setIsLeaving] = useState(false);
+
+  useEffect(() => {
+    if (!message) return;
+
+    setIsLeaving(false);
+    const fadeTimer = window.setTimeout(() => setIsLeaving(true), Math.max(0, timeoutMs - fadeMs));
+    const dismissTimer = window.setTimeout(onDismiss, timeoutMs);
+
+    return () => {
+      window.clearTimeout(fadeTimer);
+      window.clearTimeout(dismissTimer);
+    };
+  }, [fadeMs, message, onDismiss, timeoutMs]);
+
+  if (!message) return null;
+  return <div className={`error-banner transient${isLeaving ? " is-leaving" : ""}`}>{message}</div>;
 }
 
 function correctOptionId(correctAnswer: unknown) {
@@ -397,8 +491,9 @@ function LoginPage() {
   }
 
   return (
+    <>
+    <Header title="主持人登入" />
     <main className="page narrow">
-      <Header title="主持人登入" />
       <form className="panel form-stack" onSubmit={submit}>
         <ErrorBanner message={error} />
         <label>
@@ -414,6 +509,7 @@ function LoginPage() {
         <button disabled={loading}>{loading ? "登入中..." : "登入"}</button>
       </form>
     </main>
+    </>
   );
 }
 
@@ -449,11 +545,12 @@ function JoinPage() {
   }
 
   return (
+    <>
+    <Header
+      title="加入活動"
+      actions={<button onClick={() => navigate("/admin")}>主持人</button>}
+    />
     <main className="page narrow">
-      <Header
-        title="加入活動"
-        actions={<button onClick={() => navigate("/admin")}>主持人</button>}
-      />
       <section className="panel form-stack">
         <ErrorBanner message={error} />
         {savedSession.liveId && savedSession.participantToken ? (
@@ -486,6 +583,7 @@ function JoinPage() {
         </form>
       </section>
     </main>
+    </>
   );
 }
 
@@ -554,23 +652,23 @@ function DashboardPage() {
 
   return (
     <AdminGuard>
+      <Header
+        title="活動管理"
+        actions={
+          <>
+            <button
+              className="secondary"
+              onClick={() => {
+                clearAdminToken();
+                navigate("/admin");
+              }}
+            >
+              登出
+            </button>
+          </>
+        }
+      />
       <main className="page">
-        <Header
-          title="活動管理"
-          actions={
-            <>
-              <button
-                className="secondary"
-                onClick={() => {
-                  clearAdminToken();
-                  navigate("/admin");
-                }}
-              >
-                登出
-              </button>
-            </>
-          }
-        />
         <section className="panel">
           <form className="inline-form" onSubmit={createNew}>
             <input
@@ -759,6 +857,7 @@ function PdfCanvasPage({
         const outputScale = window.devicePixelRatio || 1;
         const context = targetCanvas.getContext("2d");
         if (!context) throw new Error("Canvas is not available.");
+        if (cancelled) return;
 
         targetCanvas.width = Math.floor(viewport.width * outputScale);
         targetCanvas.height = Math.floor(viewport.height * outputScale);
@@ -773,6 +872,18 @@ function PdfCanvasPage({
           viewport
         });
         await renderTask.promise;
+        // Verify the canvas actually has non-zero pixel data (detect blank renders)
+        if (cancelled) return;
+        const imageData = context.getImageData(0, 0, Math.min(10, targetCanvas.width), Math.min(10, targetCanvas.height));
+        const hasContent = imageData.data.some((v) => v !== 0);
+        if (!hasContent && !cancelled) {
+          // Retry once after a short delay
+          await new Promise((r) => window.setTimeout(r, 120));
+          if (cancelled) return;
+          context.clearRect(0, 0, viewport.width, viewport.height);
+          renderTask = page.render({ canvasContext: context, viewport });
+          await renderTask.promise;
+        }
       } catch (error) {
         if (!cancelled) {
           setError(error instanceof Error ? error.message : "PDF render failed.");
@@ -816,6 +927,9 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     itemId: string;
     position: "before" | "after";
   } | null>(null);
+  const [alarms, setAlarms] = useState<AlarmRecord[]>([]);
+  const [bellSongs, setBellSongs] = useState<string[]>([]);
+  const [alarmPreviewAudio, setAlarmPreviewAudio] = useState<HTMLAudioElement | null>(null);
   const isNewEvent = eventId === NEW_EVENT_ID;
 
   const activityListRef = useRef<HTMLElement | null>(null);
@@ -931,6 +1045,16 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    loadMusicJson().then((music) => {
+      setBellSongs(music["bell"] ?? []);
+    });
+    return () => {
+      // Cleanup preview audio
+      setAlarmPreviewAudio((prev) => { prev?.pause(); return null; });
+    };
+  }, []);
 
   useEffect(() => {
     if (!activityEditorOpen) return;
@@ -1089,6 +1213,11 @@ function EventEditorPage({ eventId }: { eventId: string }) {
     if (!token || !event) return;
     const activeEvent = await ensureEventRecord();
     if (!activeEvent) return;
+    // 限時開著就一定要填秒數；空白 → 提醒（要不限時請關閉「限時」拉桿，送出 0）。
+    if (draft.hasTimeLimit && (!draft.timeLimitSeconds || draft.timeLimitSeconds < 1)) {
+      window.alert("請輸入作答秒數，或關閉「限時」改為不限時。");
+      return;
+    }
     try {
       if (editingId) {
         await api(`/api/activities/${editingId}`, {
@@ -1315,8 +1444,8 @@ function EventEditorPage({ eventId }: { eventId: string }) {
   if (!event) {
     return (
       <AdminGuard>
+        <Header title="活動編輯" />
         <main className="page">
-          <Header title="活動編輯" />
           <p className="muted">讀取中...</p>
         </main>
       </AdminGuard>
@@ -1325,18 +1454,18 @@ function EventEditorPage({ eventId }: { eventId: string }) {
 
   return (
     <AdminGuard>
+      <Header
+        title="活動編輯"
+        actions={
+          <>
+            <button className="secondary" onClick={backToDashboard}>
+              回列表
+            </button>
+            <button form="event-settings-form">儲存活動</button>
+          </>
+        }
+      />
       <main className="page">
-        <Header
-          title="活動編輯"
-          actions={
-            <>
-              <button className="secondary" onClick={backToDashboard}>
-                回列表
-              </button>
-              <button form="event-settings-form">儲存活動</button>
-            </>
-          }
-        />
         <ErrorBanner message={error} />
         <div className="event-editor-layout">
         <aside className="panel event-settings-panel">
@@ -1394,6 +1523,66 @@ function EventEditorPage({ eventId }: { eventId: string }) {
               )}
               {uploadingPresentation ? <p className="muted">PDF 上傳中...</p> : null}
             </div>
+          </div>
+          {/* ─── Alarms ─────────────────────────────────── */}
+          <div className="event-alarms-panel">
+            <h3>鬧鐘</h3>
+            <p className="muted" style={{fontSize:"0.82rem"}}>在直播進行中，到達指定時間自動播放鈴聲。</p>
+            {alarms.map((alarm, i) => (
+              <div key={alarm.id} className="alarm-row">
+                <input
+                  type="time"
+                  value={alarm.time}
+                  onChange={(e) => {
+                    const next = [...alarms];
+                    next[i] = { ...alarm, time: e.target.value };
+                    setAlarms(next);
+                  }}
+                  className="alarm-time-input"
+                />
+                <select
+                  value={alarm.songFile}
+                  onChange={(e) => {
+                    const next = [...alarms];
+                    next[i] = { ...alarm, songFile: e.target.value };
+                    setAlarms(next);
+                  }}
+                  className="alarm-song-select"
+                >
+                  <option value="">選擇鈴聲</option>
+                  {bellSongs.map((song) => (
+                    <option key={song} value={song}>{song.replace(/\.[^.]+$/, "")}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="icon-button secondary"
+                  title="試聽"
+                  onClick={() => {
+                    if (alarmPreviewAudio) { alarmPreviewAudio.pause(); }
+                    if (alarm.songFile) {
+                      const a = new Audio(`/${alarm.songFile}`);
+                      a.play().catch(() => {});
+                      setAlarmPreviewAudio(a);
+                    }
+                  }}
+                >▶</button>
+                <button
+                  type="button"
+                  className="icon-button danger"
+                  title="刪除"
+                  onClick={() => setAlarms(alarms.filter((_, j) => j !== i))}
+                >×</button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="secondary icon-text-button"
+              onClick={() => setAlarms([...alarms, { id: crypto.randomUUID(), time: "09:00", songFile: bellSongs[0] ?? "" }])}
+            >
+              <span>+</span>
+              新增鬧鐘
+            </button>
           </div>
         </aside>
 
@@ -1508,16 +1697,19 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                               min={1}
                               max={3600}
                               disabled={!draft.hasTimeLimit}
-                              value={draft.timeLimitSeconds || 30}
-                              onChange={(change) =>
+                              value={draft.timeLimitSeconds || ""}
+                              onChange={(change) => {
+                                // Allow the field to be cleared (0/blank) so the
+                                // user can leave it empty — saveActivity then
+                                // alerts instead of silently defaulting.
+                                const raw = Math.floor(Number(change.target.value));
                                 setDraft({
                                   ...draft,
-                                  timeLimitSeconds: Math.max(
-                                    1,
-                                    Math.min(3600, Number(change.target.value) || 30)
-                                  )
-                                })
-                              }
+                                  timeLimitSeconds: Number.isFinite(raw)
+                                    ? Math.min(3600, Math.max(0, raw))
+                                    : 0
+                                });
+                              }}
                             />
                             <span className="seconds-suffix">秒</span>
                           </span>
@@ -2238,16 +2430,108 @@ function SummaryView({ summary }: { summary: ResponseSummary | null }) {
 function ChatPanel({
   role,
   messages,
+  currentParticipantId,
+  chatError,
+  onChatErrorDismiss,
+  onChatOpenChange,
   onSend,
   onModerate
 }: {
   role: "admin" | "participant";
   messages: LiveMessageRecord[];
+  currentParticipantId?: string | null;
+  chatError?: { id: number; message: string } | null;
+  onChatErrorDismiss?: () => void;
+  onChatOpenChange?: (isOpen: boolean) => void;
   onSend?: (content: string) => void;
-  onModerate?: (messageId: string, action: string) => void;
+  onModerate?: (messageId: string, action: string, content?: string) => void;
 }) {
   const [content, setContent] = useState("");
-  const visibleMessages = messages.filter((message) => message.status !== "deleted");
+  const [isOpen, setIsOpenRaw] = useState(role === "admin");
+  const setIsOpen = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    setIsOpenRaw((prev) => {
+      const next = typeof v === "function" ? v(prev) : v;
+      onChatOpenChange?.(next);
+      return next;
+    });
+  }, [onChatOpenChange]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [activeModerationMessageId, setActiveModerationMessageId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingContent, setEditingContent] = useState("");
+  const knownMessageIdsRef = useRef<Set<string> | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const panelId = useId();
+  const visibleMessages = useMemo(
+    () =>
+      messages
+        .filter((message) => message.status !== "deleted")
+        .sort((a, b) => {
+          if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        }),
+    [messages]
+  );
+
+  useEffect(() => {
+    const currentIds = new Set(visibleMessages.map((message) => message.id));
+    const knownIds = knownMessageIdsRef.current;
+
+    if (!knownIds) {
+      knownMessageIdsRef.current = currentIds;
+      return;
+    }
+
+    let newMessages = 0;
+    for (const messageId of currentIds) {
+      if (!knownIds.has(messageId)) newMessages += 1;
+    }
+
+    if (newMessages > 0 && !isOpen) {
+      setUnreadCount((current) => Math.min(99, current + newMessages));
+    }
+
+    knownMessageIdsRef.current = currentIds;
+  }, [isOpen, visibleMessages]);
+
+  useEffect(() => {
+    if (isOpen) setUnreadCount(0);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!chatError) return;
+    setIsOpen(true);
+    const timer = window.setTimeout(() => onChatErrorDismiss?.(), 2600);
+    return () => window.clearTimeout(timer);
+  }, [chatError, onChatErrorDismiss]);
+
+  useEffect(() => {
+    if (!visibleMessages.some((message) => message.id === activeModerationMessageId)) {
+      setActiveModerationMessageId(null);
+    }
+  }, [activeModerationMessageId, visibleMessages]);
+
+  useEffect(() => {
+    if (!visibleMessages.some((message) => message.id === editingMessageId)) {
+      setEditingMessageId(null);
+      setEditingContent("");
+    }
+  }, [editingMessageId, visibleMessages]);
+
+  useLayoutEffect(() => {
+    const input = chatInputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 132)}px`;
+  }, [content]);
+
+  useLayoutEffect(() => {
+    const input = editInputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+  }, [editingContent]);
 
   function sendMessage(event: React.FormEvent) {
     event.preventDefault();
@@ -2256,51 +2540,238 @@ function ChatPanel({
     setContent("");
   }
 
+  function handleMessageInputKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    if (!content.trim()) return;
+    onSend?.(content);
+    setContent("");
+  }
+
+  function moderateMessage(messageId: string, action: string) {
+    onModerate?.(messageId, action);
+    setActiveModerationMessageId(null);
+  }
+
+  function startEditingMessage(message: LiveMessageRecord) {
+    setEditingMessageId(message.id);
+    setEditingContent(message.content);
+    setActiveModerationMessageId(null);
+    window.setTimeout(() => editInputRef.current?.focus(), 0);
+  }
+
+  function cancelEditingMessage() {
+    setEditingMessageId(null);
+    setEditingContent("");
+  }
+
+  function saveEditingMessage() {
+    if (!editingMessageId) return;
+    const nextContent = editingContent.trim();
+    if (!nextContent) return;
+    onModerate?.(editingMessageId, "edit", nextContent);
+    setEditingMessageId(null);
+    setEditingContent("");
+  }
+
+  function handleEditInputKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEditingMessage();
+      return;
+    }
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    saveEditingMessage();
+  }
+
   return (
-    <aside className="chat-panel">
-      <div className="chat-header">
-        <h2>Q&A</h2>
-        <small>{visibleMessages.length} 則</small>
-      </div>
-      <div className="messages">
-        {visibleMessages.map((message) => (
-          <article className={`message ${message.status}`} key={message.id}>
-            <div className="message-meta">
-              <strong>{message.participantName}</strong>
-              {message.pinned ? <span>釘選</span> : null}
-              {role === "admin" && message.status !== "visible" ? <span>{message.status}</span> : null}
+    <div className={`floating-chat ${isOpen ? "is-open" : "is-collapsed"} ${role}`}>
+      {isOpen ? (
+        <aside className="chat-panel floating-chat-panel" id={panelId}>
+          <div className="chat-header">
+            <div className="chat-title">
+              <h2>Q&A</h2>
+              <small>{visibleMessages.length} 則</small>
             </div>
-            <p>{message.content}</p>
-            {role === "admin" ? (
-              <div className="button-row compact">
-                {message.status === "visible" ? (
-                  <button onClick={() => onModerate?.(message.id, "hide")}>隱藏</button>
-                ) : message.status === "hidden" ? (
-                  <button onClick={() => onModerate?.(message.id, "show")}>顯示</button>
-                ) : null}
-                <button onClick={() => onModerate?.(message.id, message.pinned ? "unpin" : "pin")}>
-                  {message.pinned ? "取消釘選" : "釘選"}
-                </button>
-                <button className="danger" onClick={() => onModerate?.(message.id, "delete")}>
-                  刪除
-                </button>
-              </div>
-            ) : null}
-          </article>
-        ))}
-      </div>
-      {role === "participant" ? (
-        <form className="chat-form" onSubmit={sendMessage}>
-          <input
-            value={content}
-            onChange={(event) => setContent(event.target.value)}
-            placeholder="輸入問題"
-            maxLength={200}
-          />
-          <button>送出</button>
-        </form>
+            <button
+              type="button"
+              className="icon-button chat-close-button"
+              aria-label="收合 Q&A"
+              onClick={() => setIsOpen(false)}
+            >
+              ×
+            </button>
+          </div>
+          <div className="messages">
+            {visibleMessages.length ? (
+              visibleMessages.map((message) => {
+                const canManageMessage =
+                  Boolean(onModerate) &&
+                  (role === "admin" ||
+                    (role === "participant" &&
+                      Boolean(currentParticipantId) &&
+                      message.participantId === currentParticipantId));
+                const canEditMessage =
+                  Boolean(onModerate) &&
+                  ((role === "admin" && message.participantId === null) ||
+                    (role === "participant" &&
+                      Boolean(currentParticipantId) &&
+                      message.participantId === currentParticipantId));
+                const isOwnMessage =
+                  (role === "admin" && message.participantId === null) ||
+                  (role === "participant" &&
+                    Boolean(currentParticipantId) &&
+                    message.participantId === currentParticipantId);
+                const isModerating = canManageMessage && activeModerationMessageId === message.id;
+                const isEditing = canEditMessage && editingMessageId === message.id;
+                return (
+                  <div
+                    className={`message-shell${canManageMessage ? " manageable-message" : ""}${
+                      isModerating ? " is-moderating" : ""
+                    }${message.participantId === null ? " host-message" : ""}${
+                      isOwnMessage ? " own-message" : " other-message"
+                    }`}
+                    key={message.id}
+                  >
+                    <article className={`message ${message.status}`}>
+                      <div className="message-meta">
+                        <strong>{message.participantName}</strong>
+                        {message.pinned ? <span>釘選</span> : null}
+                        {role === "admin" && message.status !== "visible" ? (
+                          <span>{message.status}</span>
+                        ) : null}
+                      </div>
+                      {isEditing ? (
+                        <div className="message-edit-form">
+                          <textarea
+                            ref={editInputRef}
+                            value={editingContent}
+                            onChange={(event) => setEditingContent(event.target.value)}
+                            onKeyDown={handleEditInputKeyDown}
+                            maxLength={200}
+                          />
+                          <div className="message-edit-actions">
+                            <button type="button" onClick={saveEditingMessage}>
+                              儲存
+                            </button>
+                            <button type="button" className="secondary" onClick={cancelEditingMessage}>
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
+                    </article>
+                    {canManageMessage && !isEditing ? (
+                      <>
+                        <button
+                          type="button"
+                          className="icon-button message-edit-button"
+                          aria-label="管理留言"
+                          aria-expanded={isModerating}
+                          onClick={() =>
+                            setActiveModerationMessageId((current) =>
+                              current === message.id ? null : message.id
+                            )
+                          }
+                        >
+                          ✎
+                        </button>
+                        {role === "admin" ? (
+                          <div
+                            className="message-moderation-actions"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            {message.status === "visible" ? (
+                              <button onClick={() => moderateMessage(message.id, "hide")}>
+                                隱藏
+                              </button>
+                            ) : message.status === "hidden" ? (
+                              <button onClick={() => moderateMessage(message.id, "show")}>
+                                顯示
+                              </button>
+                            ) : null}
+                            {canEditMessage ? (
+                              <button onClick={() => startEditingMessage(message)}>修改</button>
+                            ) : null}
+                            <button
+                              onClick={() =>
+                                moderateMessage(message.id, message.pinned ? "unpin" : "pin")
+                              }
+                            >
+                              {message.pinned ? "取消釘選" : "釘選"}
+                            </button>
+                            <button
+                              className="danger"
+                              onClick={() => moderateMessage(message.id, "delete")}
+                            >
+                              刪除
+                            </button>
+                          </div>
+                        ) : (
+                          <div
+                            className="message-moderation-actions participant-message-actions"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            <button onClick={() => startEditingMessage(message)}>修改</button>
+                            <button
+                              className="danger"
+                              onClick={() => moderateMessage(message.id, "delete")}
+                            >
+                              收回
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : null}
+                  </div>
+                );
+              })
+            ) : (
+              <p className="muted chat-empty">尚無問題。</p>
+            )}
+          </div>
+          {onSend ? (
+            <div className="chat-footer">
+              {chatError ? (
+                <div className="chat-error" role="status" aria-live="polite">
+                  {chatError.message}
+                </div>
+              ) : null}
+              <form className="chat-form" onSubmit={sendMessage}>
+                <textarea
+                  ref={chatInputRef}
+                  value={content}
+                  onChange={(event) => setContent(event.target.value)}
+                  onKeyDown={handleMessageInputKeyDown}
+                  placeholder="輸入問題"
+                  maxLength={200}
+                />
+                <button>送出</button>
+              </form>
+            </div>
+          ) : null}
+        </aside>
       ) : null}
-    </aside>
+      {!isOpen ? (
+        <button
+          type="button"
+          className="floating-chat-toggle"
+          aria-controls={panelId}
+          aria-expanded={isOpen}
+          onClick={() => setIsOpen(true)}
+        >
+          <span>Q&A</span>
+          {unreadCount > 0 ? (
+            <span className="floating-chat-badge">{unreadCount >= 99 ? "99+" : unreadCount}</span>
+          ) : (
+            <small>{visibleMessages.length}</small>
+          )}
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2419,103 +2890,211 @@ function WordCloudView({ words }: { words: WordCloudWord[] }) {
   );
 }
 
+// ─── Alarm worker helper ────────────────────────────────────────────────
+const ALARM_WORKER_CODE = `
+let timers = [];
+self.onmessage = (e) => {
+  if (e.data.type === 'schedule') {
+    const { id, targetTime, repeatMs } = e.data;
+    function check() {
+      const now = Date.now();
+      if (now >= targetTime) {
+        self.postMessage({ type: 'alarm', id });
+      } else {
+        timers.push(setTimeout(check, repeatMs || 500));
+      }
+    }
+    check();
+  }
+  if (e.data.type === 'clear') {
+    timers.forEach(clearTimeout);
+    timers = [];
+  }
+};
+`;
+
+function createAlarmWorker() {
+  const blob = new Blob([ALARM_WORKER_CODE], { type: "application/javascript" });
+  return new Worker(URL.createObjectURL(blob));
+}
+
+// ─── Music player ─────────────────────────────────────────────────────────
+type MusicJson = Record<string, string[]>;
+let musicJsonCache: MusicJson | null = null;
+async function loadMusicJson(): Promise<MusicJson> {
+  if (musicJsonCache) return musicJsonCache;
+  try {
+    const res = await fetch("/music.json");
+    musicJsonCache = await res.json();
+  } catch {
+    musicJsonCache = {};
+  }
+  return musicJsonCache!;
+}
+
+
+
+// ─── New message bubble ───────────────────────────────────────────────────
+type NewMessageBubble = {
+  id: string;
+  author: string;
+  content: string;
+};
+
+function MessageBubbleToast({ bubble, onDone }: { bubble: NewMessageBubble; onDone: () => void }) {
+  const [fading, setFading] = useState(false);
+
+  useEffect(() => {
+    const fadeTimer = window.setTimeout(() => setFading(true), 3400);
+    const doneTimer = window.setTimeout(onDone, 4000);
+    return () => {
+      window.clearTimeout(fadeTimer);
+      window.clearTimeout(doneTimer);
+    };
+  }, [onDone]);
+
+  return (
+    <div className={`message-bubble-toast${fading ? " fading" : ""}`}>
+      <strong>{bubble.author}</strong>
+      <span>{bubble.content}</span>
+    </div>
+  );
+}
+
+// ─── Activity waiting page ─────────────────────────────────────────────────
+function ActivityWaitingPage({
+  activity,
+  onStart
+}: {
+  activity: { type: ActivityType; title: string };
+  onStart: () => void;
+}) {
+  const meta = ACTIVITY_TYPE_META[activity.type];
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Enter") onStart();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onStart]);
+
+  return (
+    <div className="activity-waiting-page">
+      <div className="activity-waiting-badge">
+        <div className={`activity-type-icon large ${meta?.className ?? ""}`}>
+          {meta ? <img src={meta.icon} alt="" /> : null}
+        </div>
+        <span>{meta?.label ?? "題目"}</span>
+      </div>
+      <h2>{activity.title}</h2>
+      <p className="muted">按下「開始作答」或 Enter 開始計時</p>
+      <button onClick={onStart}>開始作答</button>
+    </div>
+  );
+}
+
+// ─── AdminLivePage ─────────────────────────────────────────────────────────
 function AdminLivePage({ liveId }: { liveId: string }) {
   const token = getAdminToken();
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMouseActive, setIsMouseActive] = useState(true);
+  const [bubbles, setBubbles] = useState<NewMessageBubble[]>([]);
+  const [chatIsOpen, setChatIsOpen] = useState(true);
+  // Activity waiting: track if we should show the waiting page before starting a timed activity
+  const [waitingForActivity, setWaitingForActivity] = useState<{
+    timelineItemId: string;
+    activity: { type: ActivityType; title: string };
+  } | null>(null);
+
+  const musicPlayer = useMemo(() => {
+    let audio: HTMLAudioElement | null = null;
+    return {
+      play: (src: string) => {
+        if (audio) { audio.pause(); audio.src = ""; }
+        audio = new Audio(src);
+        audio.play().catch(() => {});
+      },
+      stop: () => {
+        if (audio) { audio.pause(); audio.src = ""; audio = null; }
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const alarmWorkerRef = useRef<Worker | null>(null);
+
+  // Alarm worker: set up on mount, schedule alarms from event data
+  useEffect(() => {
+    const worker = createAlarmWorker();
+    alarmWorkerRef.current = worker;
+    worker.onmessage = (e) => {
+      if (e.data.type === "alarm") {
+        const alarmId = e.data.id as string;
+        // Find the alarm song
+        (async () => {
+          if (!state?.event) return;
+          // alarms stored in event record (if present)
+          const alarms = (state.event as any).alarms as AlarmRecord[] | undefined;
+          const alarm = alarms?.find((a) => a.id === alarmId);
+          if (alarm?.songFile) {
+            musicPlayer.play(`/${alarm.songFile}`);
+          }
+        })();
+      }
+    };
+    return () => {
+      worker.postMessage({ type: "clear" });
+      worker.terminate();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Schedule alarms when state loads
+  useEffect(() => {
+    const worker = alarmWorkerRef.current;
+    if (!worker || !state?.event) return;
+    const alarms = (state.event as any).alarms as AlarmRecord[] | undefined;
+    if (!alarms?.length) return;
+    worker.postMessage({ type: "clear" });
+    for (const alarm of alarms) {
+      if (!alarm.time) continue;
+      const [hh, mm] = alarm.time.split(":").map(Number);
+      const now = new Date();
+      const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0);
+      if (target.getTime() <= Date.now()) continue; // skip past alarms
+      worker.postMessage({ type: "schedule", id: alarm.id, targetTime: target.getTime(), repeatMs: 500 });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state?.event]);
+  const chatErrorIdRef = useRef(0);
   const copyTimerRef = useRef<number | null>(null);
   const qrDialogRef = useRef<HTMLDialogElement | null>(null);
-  const [tryTunnel, setTryTunnel] = useState<TryCloudflareTunnelState | null>(null);
-  const tunnelPollRef = useRef<number | null>(null);
-  const localPortForTunnel = useMemo(() => {
-    const port = window.location.port ? Number(window.location.port) : NaN;
-    if (Number.isFinite(port) && port > 0) return port;
-    return window.location.protocol === "https:" ? 443 : 80;
-  }, []);
-  const autoTunnelAttemptRef = useRef<string | null>(null);
+  const fullscreenContainerRef = useRef<HTMLDivElement | null>(null);
+  const mouseActiveTimerRef = useRef<number | null>(null);
+  const knownMessageIdsRef = useRef<Set<string> | null>(null);
+  const prevActivityIdRef = useRef<string | null>(null);
+  const prevTimeLimitRef = useRef<number>(0);
 
   const joinCode = state?.liveSession.joinCode ?? "";
-  // On a real public domain (e.g. https://slihoot.me) the page's own origin is
-  // already shareable, so the join link should just use it. The Cloudflare
-  // tunnel is only needed for local dev where the origin is localhost.
-  const isLocalhostOrigin = ["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(
-    window.location.hostname
-  );
-  const effectiveBaseUrl = useMemo(() => {
-    const tunnelUrl = tryTunnel?.status === "running" ? tryTunnel.publicUrl : null;
-    return tunnelUrl ?? window.location.origin;
-  }, [tryTunnel?.publicUrl, tryTunnel?.status]);
   const joinUrl = useMemo(() => {
     if (!joinCode) return "";
-    if (!effectiveBaseUrl) return "";
-    const url = new URL("/", effectiveBaseUrl);
+    const url = new URL("/", window.location.origin);
     url.searchParams.set("joinCode", joinCode);
     return url.toString();
-  }, [effectiveBaseUrl, joinCode]);
+  }, [joinCode]);
 
   useEffect(() => {
     return () => {
       if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+      musicPlayer.stop();
     };
-  }, []);
-
-  const loadTryTunnelState = useCallback(async () => {
-    if (!token) return null;
-    const loaded = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare", {
-      adminToken: token
-    });
-    setTryTunnel(loaded);
-    return loaded;
-  }, [token]);
-
-  useEffect(() => {
-    if (!token) return;
-    loadTryTunnelState().catch(() => {});
-  }, [loadTryTunnelState, token]);
-
-  useEffect(() => {
-    if (!token) return;
-    if (tryTunnel?.status !== "starting") return;
-
-    if (tunnelPollRef.current) window.clearInterval(tunnelPollRef.current);
-    const timer = window.setInterval(() => {
-      loadTryTunnelState().catch(() => {});
-    }, 800);
-    tunnelPollRef.current = timer;
-
-    return () => {
-      window.clearInterval(timer);
-      if (tunnelPollRef.current === timer) tunnelPollRef.current = null;
-    };
-  }, [loadTryTunnelState, token, tryTunnel?.status]);
-
-  const startTryTunnel = useCallback(async () => {
-    if (!token) return;
-    try {
-      const started = await api<TryCloudflareTunnelState>("/api/tunnel/trycloudflare/start", {
-        method: "POST",
-        adminToken: token,
-        body: { port: localPortForTunnel }
-      });
-      setTryTunnel(started);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to start tunnel.");
-    }
-  }, [localPortForTunnel, token]);
-
-  useEffect(() => {
-    if (!token) return;
-    if (!joinCode) return;
-    // Public/LAN origin is already shareable — only auto-start a tunnel on localhost.
-    if (!isLocalhostOrigin) return;
-    if (tryTunnel?.status === "running" || tryTunnel?.status === "starting") return;
-    if (autoTunnelAttemptRef.current === joinCode) return;
-
-    autoTunnelAttemptRef.current = joinCode;
-    startTryTunnel();
-  }, [isLocalhostOrigin, joinCode, startTryTunnel, token, tryTunnel?.status]);
+  }, [musicPlayer]);
 
   const copyJoinUrl = useCallback(async () => {
     if (!joinUrl) return;
@@ -2528,12 +3107,9 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const openJoinQr = useCallback(() => {
     const dialog = qrDialogRef.current;
     if (!dialog) return;
-    if (isLocalhostOrigin && tryTunnel?.status !== "running" && tryTunnel?.status !== "starting") {
-      startTryTunnel();
-    }
     if (dialog.open) return;
     dialog.showModal();
-  }, [isLocalhostOrigin, startTryTunnel, tryTunnel?.status]);
+  }, []);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -2545,6 +3121,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     ]);
     setState(liveState);
     setMessages(loadedMessages);
+    knownMessageIdsRef.current = new Set(loadedMessages.map((m) => m.id));
   }, [liveId, token]);
 
   useEffect(() => {
@@ -2576,7 +3153,17 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       );
     }
     if (message.type === "new_message") {
-      setMessages((current) => mergeMessage(current, (message.payload as any).message));
+      const msg = (message.payload as any).message as LiveMessageRecord;
+      setMessages((current) => mergeMessage(current, msg));
+      // Show bubble if chat is not open or fullscreen
+      const known = knownMessageIdsRef.current;
+      if (known && !known.has(msg.id)) {
+        setBubbles((prev) => [
+          ...prev.slice(-2),
+          { id: msg.id, author: msg.participantName ?? "匿名", content: msg.content }
+        ]);
+        known.add(msg.id);
+      }
     }
     if (message.type === "message_updated") {
       const updated = (message.payload as any).message as LiveMessageRecord | undefined;
@@ -2588,12 +3175,18 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     }
   }, []);
 
+  const showChatError = useCallback((message: string) => {
+    chatErrorIdRef.current += 1;
+    setChatError({ id: chatErrorIdRef.current, message });
+  }, []);
+  const dismissChatError = useCallback(() => setChatError(null), []);
+
   const socket = useLiveSocket({
     liveId,
     role: "admin",
     token,
     onMessage: handleMessage,
-    onError: setError
+    onError: showChatError
   });
 
   const remaining = useServerCountdown(state);
@@ -2612,6 +3205,141 @@ function AdminLivePage({ liveId }: { liveId: string }) {
   const hasCurrentActivity = Boolean(state?.currentActivity);
   const activityOpen = Boolean(state?.activityOpen);
   const answerClosed = Boolean(state?.answerClosed);
+  const isTimedActivity = (state?.currentActivity?.timeLimitSeconds ?? 0) > 0;
+
+  // Activity change: detect transition and show waiting page for timed activities
+  useEffect(() => {
+    const currentActivity = state?.currentActivity;
+    const currentActivityId = currentActivity?.id ?? null;
+    const currentTimeLimit = currentActivity?.timeLimitSeconds ?? 0;
+    const prevActivityId = prevActivityIdRef.current;
+
+    if (currentActivityId && currentActivityId !== prevActivityId) {
+      // New activity loaded
+      const prevItem = prevActivityId;
+      const prevWasPdf = !prevItem; // simplified: if no previous activity, treat as fresh start
+      const prevTimelineIndex = currentIndex - 1;
+      const prevItem2 = timeline[prevTimelineIndex];
+      const prevWasPdfOrNoActivity = !prevItem2 || prevItem2.type === "pdf_page";
+
+      if (currentTimeLimit > 0 && prevWasPdfOrNoActivity && !activityOpen) {
+        // Show waiting page
+        setWaitingForActivity({
+          timelineItemId: currentTimelineItem?.id ?? "",
+          activity: { type: currentActivity!.type, title: currentActivity!.title }
+        });
+      } else {
+        setWaitingForActivity(null);
+      }
+    }
+    if (!currentActivityId) {
+      setWaitingForActivity(null);
+    }
+    prevActivityIdRef.current = currentActivityId;
+    prevTimeLimitRef.current = currentTimeLimit;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state?.currentActivity?.id]);
+
+  // Music: play game music when timed activity starts
+  useEffect(() => {
+    if (activityOpen && isTimedActivity) {
+      loadMusicJson().then((music) => {
+        const gameSongs = music["game"] ?? [];
+        if (gameSongs.length) {
+          const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
+          musicPlayer.play(`/${song}`);
+        }
+      });
+    } else {
+      // Stop music when time's up or activity not open
+      if (!activityOpen || remaining === 0) {
+        musicPlayer.stop();
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityOpen, isTimedActivity]);
+
+  useEffect(() => {
+    if (remaining === 0) musicPlayer.stop();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remaining]);
+
+  // Hotkeys for navigation
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Don't fire if user is typing
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const isEditable = (e.target as HTMLElement)?.isContentEditable;
+      if (isEditable) return;
+
+      if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) {
+        if (previousTimelineItem && socket.connected) {
+          socket.send("change_timeline_item", { timelineItemId: previousTimelineItem.id });
+        }
+      }
+      if (["ArrowRight", "ArrowDown", "PageDown"].includes(e.key)) {
+        if (nextTimelineItem && socket.connected) {
+          socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id });
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [previousTimelineItem, nextTimelineItem, socket]);
+
+  // Fullscreen mouse-hide
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const handleMove = () => {
+      setIsMouseActive(true);
+      if (mouseActiveTimerRef.current) window.clearTimeout(mouseActiveTimerRef.current);
+      mouseActiveTimerRef.current = window.setTimeout(() => setIsMouseActive(false), 3000);
+    };
+    window.addEventListener("mousemove", handleMove);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      if (mouseActiveTimerRef.current) window.clearTimeout(mouseActiveTimerRef.current);
+    };
+  }, [isFullscreen]);
+
+  // Fullscreen API
+  const enterFullscreen = useCallback(() => {
+    const el = fullscreenContainerRef.current;
+    if (el?.requestFullscreen) {
+      el.requestFullscreen().catch(() => {});
+    }
+    setIsFullscreen(true);
+    setIsMouseActive(true);
+  }, []);
+
+  const exitFullscreen = useCallback(() => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    setIsFullscreen(false);
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      if (!document.fullscreenElement) setIsFullscreen(false);
+    };
+    document.addEventListener("fullscreenchange", handler);
+    return () => document.removeEventListener("fullscreenchange", handler);
+  }, []);
+
+  // Open new window for fullscreen on another screen
+  const openFullscreenWindow = useCallback(() => {
+    const w = window.open(
+      `/admin/live/${liveId}/fullscreen`,
+      "slihoot-presentation",
+      "width=1280,height=720,toolbar=no,menubar=no,scrollbars=no"
+    );
+    if (!w) return;
+    // Pass current state via postMessage after window loads
+    const onLoad = () => {
+      w.postMessage({ type: "init_fullscreen", liveId, token }, "*");
+    };
+    w.addEventListener("load", onLoad, { once: true });
+  }, [liveId, token]);
 
   async function endLive() {
     if (!token || !confirm("結束這場活動？")) return;
@@ -2623,6 +3351,20 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       navigate("/admin/dashboard");
     } catch (error) {
       setError(error instanceof Error ? error.message : "結束活動失敗");
+    }
+  }
+
+  async function resetActivity() {
+    if (!token || !state?.currentActivity) return;
+    if (!confirm("重置這題？計時將重新開始，所有作答紀錄將清除。")) return;
+    try {
+      await api(`/api/live-sessions/${liveId}/reset-activity`, {
+        method: "POST",
+        adminToken: token
+      });
+      musicPlayer.stop();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "重置失敗");
     }
   }
 
@@ -2648,13 +3390,138 @@ function AdminLivePage({ liveId }: { liveId: string }) {
     }
   }
 
+  function handleStartActivity() {
+    setWaitingForActivity(null);
+    socket.send("start_activity", {});
+    // Start music
+    loadMusicJson().then((music) => {
+      const gameSongs = music["game"] ?? [];
+      if (gameSongs.length) {
+        const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
+        musicPlayer.play(`/${song}`);
+      }
+    });
+  }
+
+  const stagePart = (
+    <div className="question-block">
+      <small>
+        {currentIndex >= 0 ? currentIndex + 1 : 0} / {timeline.length}
+      </small>
+      {isPdfPage ? (
+        <>
+          <PdfCanvasPage
+            className="presentation-stage"
+            url={presentationFileUrl}
+            pageNumber={currentTimelineItem?.pageNumber}
+            style={presentationStageStyle(state?.presentation, currentTimelineItem?.pageNumber)}
+          />
+        </>
+      ) : waitingForActivity && !activityOpen ? (
+        <ActivityWaitingPage
+          activity={waitingForActivity.activity}
+          onStart={handleStartActivity}
+        />
+      ) : (
+        <>
+          <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
+          <p>{state?.currentActivity?.description}</p>
+          {answerClosed ? (
+            <div className="countdown ended">已結束作答（已公布答案）</div>
+          ) : remaining !== null ? (
+            <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
+              {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
+            </div>
+          ) : hasCurrentActivity && !activityOpen ? (
+            <div className="countdown">尚未開始作答，參與者看不到題目</div>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+
+  const controlPart = (
+    <div className="button-row">
+      {hasCurrentActivity && !activityOpen && !waitingForActivity ? (
+        <button
+          disabled={!socket.connected}
+          title={!socket.connected ? "連線中，請稍候" : undefined}
+          onClick={() => socket.send("start_activity", {})}
+        >
+          開始答題
+        </button>
+      ) : null}
+      <button
+        disabled={!previousTimelineItem || !socket.connected}
+        onClick={() =>
+          previousTimelineItem &&
+          socket.send("change_timeline_item", { timelineItemId: previousTimelineItem.id })
+        }
+      >
+        上一頁
+      </button>
+      <button
+        disabled={!nextTimelineItem || !socket.connected}
+        onClick={() =>
+          nextTimelineItem &&
+          socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id })
+        }
+      >
+        下一頁
+      </button>
+      <button
+        hidden={!hasCurrentActivity || isWordCloudActivity || isTimedActivity}
+        disabled={!socket.connected || Boolean(state?.liveSession.showResults)}
+        title={
+          !socket.connected
+            ? "連線中，請稍候"
+            : state?.liveSession.showResults
+              ? "答案已公布，本題作答已結束"
+              : "公布答案並結束本題作答"
+        }
+        onClick={() => socket.send("set_results_visibility", { showResults: true })}
+      >
+        公布答案
+      </button>
+      <button
+        hidden={!hasCurrentActivity || isWordCloudActivity}
+        disabled={!socket.connected}
+        onClick={() =>
+          socket.send("set_participant_name_visibility", {
+            showParticipantNames: !state?.liveSession.showParticipantNames
+          })
+        }
+      >
+        {state?.liveSession.showParticipantNames ? "匿名明細" : "記名明細"}
+      </button>
+      {hasCurrentActivity ? (
+        <button
+          className="secondary"
+          title="重置這題的計時和作答"
+          onClick={resetActivity}
+        >
+          重置
+        </button>
+      ) : null}
+      <button className="danger" onClick={endLive}>
+        結束
+      </button>
+    </div>
+  );
+
   return (
     <AdminGuard>
+      <Header
+        title="主持畫面"
+        actions={
+          <>
+            <button className="secondary icon-button" title="進入全螢幕" onClick={enterFullscreen}>⛶</button>
+            <button className="secondary icon-button" title="在新視窗開啟展示" onClick={openFullscreenWindow}>⊹</button>
+            <button onClick={() => navigate("/admin/dashboard")}>回列表</button>
+          </>
+        }
+      />
       <main className="page live-layout">
-        <Header
-          title="主持畫面"
-          actions={<button onClick={() => navigate("/admin/dashboard")}>回列表</button>}
-        />
         <ErrorBanner message={error} />
         <dialog
           ref={qrDialogRef}
@@ -2677,10 +3544,6 @@ function AdminLivePage({ liveId }: { liveId: string }) {
                 ×
               </button>
             </div>
-            {tryTunnel?.status === "starting" ? (
-              <p className="muted">Cloudflare 分享連結產生中...</p>
-            ) : null}
-            {tryTunnel?.lastError ? <div className="error-banner">{tryTunnel.lastError}</div> : null}
             {joinUrl ? (
               <div className="qr-preview">
                 <QRCodeSVG value={joinUrl} size={260} marginSize={4} />
@@ -2699,6 +3562,83 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             </div>
           </form>
         </dialog>
+
+        {/* Fullscreen overlay */}
+        <div
+          ref={fullscreenContainerRef}
+          className={`fullscreen-container${isFullscreen ? " is-fullscreen" : ""}${isFullscreen && !isMouseActive ? " hide-controls" : ""}`}
+        >
+          {isFullscreen ? (
+            <>
+              <div className="fullscreen-stage">
+                {isPdfPage ? (
+                  <PdfCanvasPage
+                    className="presentation-stage fullscreen-pdf"
+                    url={presentationFileUrl}
+                    pageNumber={currentTimelineItem?.pageNumber}
+                    style={{ width: "100%", height: "100%", maxHeight: "none", borderRadius: 0 }}
+                  />
+                ) : waitingForActivity && !activityOpen ? (
+                  <ActivityWaitingPage
+                    activity={waitingForActivity.activity}
+                    onStart={handleStartActivity}
+                  />
+                ) : (
+                  <div className="fullscreen-activity">
+                    <h2>{state?.currentActivity?.title ?? "等待中"}</h2>
+                    {state?.currentActivity?.description ? <p>{state.currentActivity.description}</p> : null}
+                    {answerClosed ? (
+                      <div className="countdown ended">已結束作答</div>
+                    ) : remaining !== null ? (
+                      <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
+                        {remaining === 0 ? "時間到" : `剩餘 ${remaining} 秒`}
+                      </div>
+                    ) : null}
+                    {hasCurrentActivity && (state?.liveSession.showResults || answerClosed) ? (
+                      <div className="fullscreen-results">
+                        <SummaryView summary={state?.responseSummary ?? null} />
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+              <div className="fullscreen-controls">
+                <div className="fullscreen-status">
+                  <span className={socket.connected ? "status online" : "status"} />
+                  <strong>{joinCode}</strong>
+                  <span>{state?.participantCount ?? 0} 人</span>
+                  <span>{currentIndex + 1} / {timeline.length}</span>
+                </div>
+                <div className="fullscreen-buttons">
+                  {hasCurrentActivity && !activityOpen && !waitingForActivity ? (
+                    <button onClick={() => socket.send("start_activity", {})}>開始答題</button>
+                  ) : null}
+                  <button
+                    disabled={!previousTimelineItem || !socket.connected}
+                    onClick={() => previousTimelineItem && socket.send("change_timeline_item", { timelineItemId: previousTimelineItem.id })}
+                  >上一頁</button>
+                  <button
+                    disabled={!nextTimelineItem || !socket.connected}
+                    onClick={() => nextTimelineItem && socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id })}
+                  >下一頁</button>
+                  <button className="secondary" onClick={exitFullscreen}>離開全螢幕</button>
+                </div>
+              </div>
+              {/* Bubbles in fullscreen */}
+              <div className="bubble-toast-stack">
+                {bubbles.map((b) => (
+                  <MessageBubbleToast
+                    key={b.id}
+                    bubble={b}
+                    onDone={() => setBubbles((prev) => prev.filter((x) => x.id !== b.id))}
+                  />
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+
+        {/* Normal live page */}
         <section className="live-main panel">
           <div className="status-row">
             <span className={socket.connected ? "status online" : "status"} />
@@ -2709,96 +3649,8 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             <span>{state?.participantCount ?? 0} 人加入</span>
             <span>{state?.liveSession.status}</span>
           </div>
-          <div className="question-block">
-            <small>
-              {currentIndex >= 0 ? currentIndex + 1 : 0} / {timeline.length}
-            </small>
-            {isPdfPage ? (
-              <>
-                <PdfCanvasPage
-                  className="presentation-stage"
-                  url={presentationFileUrl}
-                  pageNumber={currentTimelineItem?.pageNumber}
-                  style={presentationStageStyle(state?.presentation, currentTimelineItem?.pageNumber)}
-                />
-              </>
-            ) : (
-              <>
-                <h2>{state?.currentActivity?.title ?? "尚無題目"}</h2>
-                <p>{state?.currentActivity?.description}</p>
-                {answerClosed ? (
-                  <div className="countdown ended">已結束作答（已公布答案）</div>
-                ) : remaining !== null ? (
-                  <div className={`countdown${remaining === 0 ? " ended" : ""}`}>
-                    {remaining === 0 ? "時間到（已公布答案）" : `剩餘 ${remaining} 秒`}
-                  </div>
-                ) : hasCurrentActivity && !activityOpen ? (
-                  <div className="countdown">尚未開始作答，參與者看不到題目</div>
-                ) : null}
-              </>
-            )}
-          </div>
-          <div className="button-row">
-            {hasCurrentActivity && !activityOpen ? (
-              <button
-                disabled={!socket.connected}
-                title={!socket.connected ? "連線中，請稍候" : undefined}
-                onClick={() => socket.send("start_activity", {})}
-              >
-                開始答題
-              </button>
-            ) : null}
-            <button
-              disabled={!previousTimelineItem || !socket.connected}
-              onClick={() =>
-                previousTimelineItem &&
-                socket.send("change_timeline_item", { timelineItemId: previousTimelineItem.id })
-              }
-            >
-              上一頁
-            </button>
-            <button
-              disabled={!nextTimelineItem || !socket.connected}
-              onClick={() =>
-                nextTimelineItem &&
-                socket.send("change_timeline_item", { timelineItemId: nextTimelineItem.id })
-              }
-            >
-              下一頁
-            </button>
-            <button
-              hidden={!hasCurrentActivity || isWordCloudActivity}
-              disabled={!socket.connected || (remaining !== null && remaining > 0)}
-              title={
-                !socket.connected
-                  ? "連線中，請稍候"
-                  : remaining !== null && remaining > 0
-                    ? "倒數結束後才能公布結果"
-                    : undefined
-              }
-              onClick={() =>
-                socket.send("set_results_visibility", {
-                  showResults: !state?.liveSession.showResults
-                })
-              }
-            >
-              {state?.liveSession.showResults ? "隱藏結果" : "顯示結果"}
-            </button>
-            <button
-              hidden={!hasCurrentActivity || isWordCloudActivity}
-              disabled={!socket.connected}
-              onClick={() =>
-                socket.send("set_participant_name_visibility", {
-                  showParticipantNames: !state?.liveSession.showParticipantNames
-                })
-              }
-            >
-              {state?.liveSession.showParticipantNames ? "匿名明細" : "記名明細"}
-            </button>
-            <button className="danger" onClick={endLive}>
-              結束
-            </button>
-          </div>
+          {stagePart}
+          {controlPart}
           {!socket.connected ? (
             <p className="muted">連線中，請稍候再操作...</p>
           ) : null}
@@ -2825,11 +3677,27 @@ function AdminLivePage({ liveId }: { liveId: string }) {
             <p className="muted">包含這個活動所有場次的作答紀錄、答對與分數。</p>
           </section>
         </section>
+
+        {/* Bubble toasts (non-fullscreen) */}
+        <div className="bubble-toast-stack">
+          {!isFullscreen && bubbles.map((b) => (
+            <MessageBubbleToast
+              key={b.id}
+              bubble={b}
+              onDone={() => setBubbles((prev) => prev.filter((x) => x.id !== b.id))}
+            />
+          ))}
+        </div>
+
         <ChatPanel
           role="admin"
           messages={messages}
-          onModerate={(messageId, action) =>
-            socket.send("moderate_message", { messageId, action })
+          chatError={chatError}
+          onChatErrorDismiss={dismissChatError}
+          onChatOpenChange={setChatIsOpen}
+          onSend={(content) => socket.send("send_message", { content })}
+          onModerate={(messageId, action, content) =>
+            socket.send("moderate_message", { messageId, action, content })
           }
         />
       </main>
@@ -3002,6 +3870,8 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
   const [state, setState] = useState<LiveState | null>(null);
   const [messages, setMessages] = useState<LiveMessageRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<{ id: number; message: string } | null>(null);
+  const chatErrorIdRef = useRef(0);
   const [localResponse, setLocalResponse] = useState<ResponseRecord | null>(null);
 
   useEffect(() => {
@@ -3040,6 +3910,12 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
     }
     if (message.type === "message_updated") {
       const payload = message.payload as any;
+      if (payload.message) {
+        setMessages((current) =>
+          mergeMessage(current, payload.message).filter((candidate) => candidate.status === "visible")
+        );
+        return;
+      }
       setMessages((current) =>
         current
           .map((candidate) =>
@@ -3052,12 +3928,18 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
     }
   }, []);
 
+  const showChatError = useCallback((message: string) => {
+    chatErrorIdRef.current += 1;
+    setChatError({ id: chatErrorIdRef.current, message });
+  }, []);
+  const dismissChatError = useCallback(() => setChatError(null), []);
+
   const socket = useLiveSocket({
     liveId,
     role: "participant",
     token: participantToken,
     onMessage: handleMessage,
-    onError: setError
+    onError: showChatError
   });
 
   const currentActivity = state?.currentActivity ?? null;
@@ -3086,18 +3968,21 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
 
   if (!participantToken) {
     return (
+      <>
+      <Header title="活動" />
       <main className="page narrow">
-        <Header title="活動" />
         <ErrorBanner message={error} />
         <button onClick={() => navigate("/")}>重新加入</button>
       </main>
+      </>
     );
   }
 
   if (state?.liveSession.status === "ended") {
     return (
+      <>
+      <Header title={state.event.title} />
       <main className="page narrow">
-        <Header title={state.event.title} />
         <ErrorBanner message={error} />
         <section className="panel form-stack">
           <h2>活動已結束</h2>
@@ -3113,13 +3998,19 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
           </button>
         </section>
       </main>
+      </>
     );
   }
 
   return (
+    <>
+    <Header title={state?.event.title ?? "活動中"} actions={<button onClick={() => navigate("/")}>首頁</button>} />
     <main className="page live-layout participant">
-      <Header title={state?.event.title ?? "活動中"} actions={<button onClick={() => navigate("/")}>首頁</button>} />
-      <ErrorBanner message={error} />
+      {error ? (
+        <div className="error-stack">
+          <ErrorBanner message={error} />
+        </div>
+      ) : null}
       <section className="live-main panel">
         <div className="status-row">
           <span className={socket.connected ? "status online" : "status"} />
@@ -3190,9 +4081,16 @@ function ParticipantLivePage({ liveId }: { liveId: string }) {
       <ChatPanel
         role="participant"
         messages={sortedMessages}
+        currentParticipantId={state?.me?.id}
+        chatError={chatError}
+        onChatErrorDismiss={dismissChatError}
         onSend={(content) => socket.send("send_message", { content })}
+        onModerate={(messageId, action, content) =>
+          socket.send("moderate_message", { messageId, action, content })
+        }
       />
     </main>
+    </>
   );
 }
 

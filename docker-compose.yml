@@ -25,6 +25,11 @@ services:
       DB_NAME: slihoot
       DB_AUTO_MIGRATE: "true"
       REDIS_URL: redis://redis:6379
+    # Persist uploaded presentation PDFs across container rebuilds/restarts.
+    # Without this the files (written to /app/uploads) are lost on every
+    # `docker compose up --build`, leaving DB rows pointing at missing files.
+    volumes:
+      - uploads-data:/app/uploads
     depends_on:
       mysql:
         condition: service_healthy
@@ -93,3 +98,4 @@ volumes:
   mysql-data:
   caddy-data:
   caddy-config:
+  uploads-data:

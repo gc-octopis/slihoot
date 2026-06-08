@@ -77,10 +77,11 @@ bun run dev:web      # Vite frontend (another terminal)
 
 ### Join from a phone
 
-Sharing a `localhost` link won't work on phones. Either:
+The local QR/share dialog intentionally stays on the current origin and does not auto-start
+an external tunnel. Sharing a `localhost` link won't work on phones. Either:
 
 1. **Same Wi-Fi / LAN:** `bun run dev:web` serves on `0.0.0.0`; share `http://<your-lan-ip>:5173/`.
-2. **Different networks:** install `cloudflared` and start a free quick tunnel from the admin Live page → `QR Code` → `Cloudflare Quick Tunnel` → `Start`.
+2. **Different networks:** use the deployed remote site, or explicitly run your own tunnel when you need external access to the local dev server.
 
 ## Run the full stack with Docker
 
