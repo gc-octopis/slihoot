@@ -1798,8 +1798,10 @@ function EventEditorPage({ eventId }: { eventId: string }) {
                   onClick={() => {
                     if (alarmPreviewAudio) { alarmPreviewAudio.pause(); }
                     if (alarm.songFile) {
-                      const a = new Audio(`/${alarm.songFile}`);
-                      a.play().catch(() => {});
+                      const a = new Audio(publicAssetUrl(alarm.songFile));
+                      a.play().catch(() => {
+                        setError("鈴聲播放失敗。請確認部署環境有拉到 Git LFS 音檔。");
+                      });
                       setAlarmPreviewAudio(a);
                     }
                   }}
@@ -3172,6 +3174,10 @@ async function loadMusicJson(): Promise<MusicJson> {
 
 
 // ─── New message bubble ───────────────────────────────────────────────────
+function publicAssetUrl(fileName: string) {
+  return `/${encodeURIComponent(fileName)}`;
+}
+
 type NewMessageBubble = {
   id: string;
   author: string;
@@ -3276,7 +3282,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         const alarmId = e.data.id as string;
         const alarm = latestAlarmsRef.current.find((candidate) => candidate.id === alarmId);
         if (alarm?.songFile) {
-          musicPlayer.play(`/${alarm.songFile}`);
+          musicPlayer.play(publicAssetUrl(alarm.songFile));
         }
       }
     };
@@ -3485,7 +3491,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
         const gameSongs = music["game"] ?? [];
         if (gameSongs.length) {
           const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
-          musicPlayer.play(`/${song}`);
+          musicPlayer.play(publicAssetUrl(song));
         }
       });
     } else {
@@ -3614,7 +3620,7 @@ function AdminLivePage({ liveId }: { liveId: string }) {
       const gameSongs = music["game"] ?? [];
       if (gameSongs.length) {
         const song = gameSongs[Math.floor(Math.random() * gameSongs.length)];
-        musicPlayer.play(`/${song}`);
+        musicPlayer.play(publicAssetUrl(song));
       }
     });
   }

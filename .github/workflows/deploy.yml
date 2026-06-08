@@ -39,6 +39,8 @@ jobs:
             set -euo pipefail
             cd "${DEPLOY_DIR:-/opt/slihoot}"
             git pull --ff-only
+            git lfs install --local
+            git lfs pull
             docker compose up -d --build
             docker image prune -f
             docker compose ps

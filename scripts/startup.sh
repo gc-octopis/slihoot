@@ -29,12 +29,21 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! git lfs version >/dev/null 2>&1; then
+  echo "[startup] installing git-lfs..."
+  apt-get update
+  apt-get install -y git-lfs
+fi
+
 cd "${APP_DIR}"
 
 if [[ ! -f .env ]]; then
   echo "[startup] WARNING: ${APP_DIR}/.env not found — using defaults from docker-compose.yml." >&2
   echo "[startup] Set ADMIN_PASSWORD / JWT_SECRET / DB_PASSWORD / MYSQL_ROOT_PASSWORD / DOMAIN before going live." >&2
 fi
+
+git lfs install --local
+git lfs pull
 
 # --- Build and start -------------------------------------------------------
 echo "[startup] building and starting stack..."
