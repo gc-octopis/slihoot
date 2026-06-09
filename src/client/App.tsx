@@ -163,6 +163,10 @@ const EXPORT_NOTES_ICON_URL = new URL(
   "../../svgs/export_notes_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
   import.meta.url
 ).href;
+const QR_CODE_ICON_URL = new URL(
+  "../../svgs/qr_code_24dp_4B2F8F_FILL0_wght400_GRAD0_opsz24.svg",
+  import.meta.url
+).href;
 let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
 const pdfDocumentCache = new Map<string, Promise<PdfDocumentProxy>>();
 
@@ -3540,6 +3544,14 @@ function AdminLivePage({
   const [chatOpenRequest, setChatOpenRequest] = useState(0);
   const [chatCloseRequest, setChatCloseRequest] = useState(presentationWindow ? 1 : 0);
   const [scoreboardOpen, setScoreboardOpen] = useState(false);
+  const joinQrStorageKey = useMemo(() => `slihoot:join-qr-visible:${liveId}`, [liveId]);
+  const [joinQrVisible, setJoinQrVisible] = useState(() => {
+    try {
+      return window.localStorage.getItem(`slihoot:join-qr-visible:${liveId}`) === "true";
+    } catch {
+      return false;
+    }
+  });
   // Activity waiting: track if we should show the waiting page before starting a timed activity
   const [waitingForActivity, setWaitingForActivity] = useState<{
     timelineItemId: string;
@@ -3624,6 +3636,40 @@ function AdminLivePage({
     url.searchParams.set("joinCode", joinCode);
     return url.toString();
   }, [joinCode]);
+
+  useEffect(() => {
+    try {
+      setJoinQrVisible(window.localStorage.getItem(joinQrStorageKey) === "true");
+    } catch {
+      setJoinQrVisible(false);
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === joinQrStorageKey) {
+        setJoinQrVisible(event.newValue === "true");
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [joinQrStorageKey]);
+
+  const setPinnedJoinQrVisible = useCallback(
+    (nextVisible: boolean) => {
+      setJoinQrVisible(nextVisible);
+      try {
+        window.localStorage.setItem(joinQrStorageKey, nextVisible ? "true" : "false");
+      } catch {
+        // Local storage is only for syncing separate fullscreen windows.
+      }
+    },
+    [joinQrStorageKey]
+  );
+
+  const togglePinnedJoinQr = useCallback(() => {
+    if (!joinUrl) return;
+    setPinnedJoinQrVisible(!joinQrVisible);
+  }, [joinQrVisible, joinUrl, setPinnedJoinQrVisible]);
 
   useEffect(() => {
     return () => {
@@ -4199,6 +4245,17 @@ function AdminLivePage({
                 <div className="fullscreen-status">
                   <span className={socket.connected ? "status online" : "status"} />
                   <strong>{joinCode}</strong>
+                  <button
+                    type="button"
+                    className={`secondary icon-button join-qr-toggle${joinQrVisible ? " is-active" : ""}`}
+                    aria-pressed={joinQrVisible}
+                    aria-label={joinQrVisible ? "隱藏 QR Code" : "顯示 QR Code"}
+                    title={joinQrVisible ? "隱藏 QR Code" : "顯示 QR Code"}
+                    disabled={!joinUrl}
+                    onClick={togglePinnedJoinQr}
+                  >
+                    <img src={QR_CODE_ICON_URL} alt="" aria-hidden="true" />
+                  </button>
                   <span>{state?.participantCount ?? 0} 人</span>
                   <span>{currentIndex + 1} / {timeline.length}</span>
                 </div>
@@ -4267,6 +4324,12 @@ function AdminLivePage({
                   </button>
                 </div>
               </div>
+              <div
+                className={`fullscreen-join-qr-panel${joinQrVisible && joinUrl ? " is-visible" : ""}`}
+                aria-hidden={!joinQrVisible || !joinUrl}
+              >
+                {joinUrl ? <QRCodeSVG value={joinUrl} size={132} marginSize={2} /> : null}
+              </div>
               {/* Bubbles in fullscreen */}
               <div className="bubble-toast-stack">
                 {bubbles.map((b) => (
@@ -4299,6 +4362,23 @@ function AdminLivePage({
           <div className="status-row">
             <span className={socket.connected ? "status online" : "status"} />
             <strong>代碼 {joinCode || "..."}</strong>
+            <div
+              className={`inline-join-qr${joinQrVisible && joinUrl ? " is-visible" : ""}`}
+              aria-hidden={!joinQrVisible || !joinUrl}
+            >
+              {joinUrl ? <QRCodeSVG value={joinUrl} size={92} marginSize={2} /> : null}
+            </div>
+            <button
+              type="button"
+              className={`secondary icon-button join-qr-toggle${joinQrVisible ? " is-active" : ""}`}
+              aria-pressed={joinQrVisible}
+              aria-label={joinQrVisible ? "隱藏 QR Code" : "顯示 QR Code"}
+              title={joinQrVisible ? "隱藏 QR Code" : "顯示 QR Code"}
+              disabled={!joinUrl}
+              onClick={togglePinnedJoinQr}
+            >
+              <img src={QR_CODE_ICON_URL} alt="" aria-hidden="true" />
+            </button>
             <button className="secondary" disabled={!joinCode} onClick={openJoinQr}>
               分享連結
             </button>

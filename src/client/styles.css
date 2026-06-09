@@ -438,6 +438,21 @@ small {
   font-size: 0.98rem;
 }
 
+.join-qr-toggle {
+  flex: 0 0 38px;
+}
+
+.join-qr-toggle img {
+  display: block;
+  width: 21px;
+  height: 21px;
+}
+
+.join-qr-toggle.is-active {
+  outline: 2px solid rgba(75, 47, 143, 0.32);
+  outline-offset: 2px;
+}
+
 .export-menu-wrap {
   position: relative;
   display: inline-flex;
@@ -1644,6 +1659,36 @@ small {
   color: var(--muted-strong);
 }
 
+.inline-join-qr {
+  display: grid;
+  flex: 0 0 0;
+  width: 0;
+  max-width: 0;
+  place-items: center;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(-8px) scale(0.96);
+  transition:
+    flex-basis 220ms ease,
+    max-width 220ms ease,
+    opacity 180ms ease,
+    transform 220ms ease;
+}
+
+.inline-join-qr.is-visible {
+  flex-basis: 100px;
+  max-width: 100px;
+  opacity: 1;
+  transform: translateX(0) scale(1);
+}
+
+.inline-join-qr svg {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
 .status {
   width: 11px;
   height: 11px;
@@ -2481,6 +2526,45 @@ small {
   gap: 14px;
   color: rgba(255, 255, 255, 0.8);
   font-size: 0.9rem;
+}
+
+.fullscreen-status .join-qr-toggle {
+  min-height: 34px;
+  width: 34px;
+  min-width: 34px;
+  flex-basis: 34px;
+}
+
+.fullscreen-status .join-qr-toggle img {
+  width: 20px;
+  height: 20px;
+}
+
+.fullscreen-join-qr-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1000004;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  border-radius: 0 0 18px 0;
+  background: #fff;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-110%, -110%);
+  transition:
+    opacity 220ms ease,
+    transform 280ms ease;
+}
+
+.fullscreen-join-qr-panel.is-visible {
+  opacity: 1;
+  transform: translate(0, 0);
+}
+
+.fullscreen-join-qr-panel svg {
+  display: block;
 }
 
 .fullscreen-buttons {
