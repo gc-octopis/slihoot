@@ -137,7 +137,7 @@ const ACTIVITY_TYPE_META: Record<ActivityType, { label: string; icon: string; cl
   poll: {
     label: "投票",
     icon: new URL(
-      "../../svgs/format_list_bulleted_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
+      "../../svgs/how_to_vote_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
       import.meta.url
     ).href,
     className: "type-poll"
